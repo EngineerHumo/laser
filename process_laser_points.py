@@ -214,7 +214,7 @@ def process_file(json_path: Path, image_path: Path, output_dir: Path) -> Optiona
     if not image_path.exists():
         raise FileNotFoundError(f"Missing image file for {json_path.name}: {image_path}")
 
-    output_filename = f"{image_path.stem}——masked{image_path.suffix}"
+    output_filename = f"{image_path.stem}_masked{image_path.suffix}"
     output_path = output_dir / output_filename
     try:
         if Image is not None:
