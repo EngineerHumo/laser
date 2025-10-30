@@ -1,0 +1,312 @@
+"""Training script for deep metric learning spot grading."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+import numpy as np
+import torch
+from torch import nn
+from torch.cuda import amp
+from torch.utils.data import DataLoader, Subset
+
+from laser.datasets import SpotDataset, SpotSample, create_stratified_folds
+from laser.models import DualEncoderMetricModel
+from laser.models.losses import ArcMarginProduct, batch_hard_triplet_loss
+from laser.utils import VisdomLogger
+
+LOGGER = logging.getLogger("train")
+
+
+@dataclass
+class TrainConfig:
+    data_dir: Path
+    batch_size: int = 64
+    num_epochs: int = 30
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    num_workers: int = 4
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    triplet_margin: float = 0.3
+    triplet_weight: float = 1.0
+    visdom_env: str = "spot_metric_learning"
+    log_dir: Path = Path("logs")
+    fold_count: int = 5
+    amp: bool = True
+
+
+def parse_args() -> TrainConfig:
+    parser = argparse.ArgumentParser(description="Train deep metric learning model for spot grading")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--triplet-margin", type=float, default=0.3)
+    parser.add_argument("--triplet-weight", type=float, default=1.0)
+    parser.add_argument("--visdom-env", type=str, default="spot_metric_learning")
+    parser.add_argument("--log-dir", type=Path, default=Path("logs"))
+    parser.add_argument("--fold-count", type=int, default=5)
+    parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
+    args = parser.parse_args()
+
+    return TrainConfig(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_epochs=args.epochs,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        num_workers=args.num_workers,
+        device=args.device,
+        triplet_margin=args.triplet_margin,
+        triplet_weight=args.triplet_weight,
+        visdom_env=args.visdom_env,
+        log_dir=args.log_dir,
+        fold_count=args.fold_count,
+        amp=not args.no_amp,
+    )
+
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def collate_fn(batch: Iterable[SpotSample]) -> Dict[str, torch.Tensor]:
+    batch_list = list(batch)
+    spot = torch.stack([item.spot_image for item in batch_list])
+    global_img = torch.stack([item.global_image for item in batch_list])
+    labels = torch.tensor([item.label for item in batch_list], dtype=torch.long)
+    return {"spot": spot, "global": global_img, "labels": labels}
+
+
+def create_dataloaders(dataset: SpotDataset, train_indices: List[int], val_indices: List[int], config: TrainConfig) -> Tuple[DataLoader, DataLoader]:
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+        collate_fn=collate_fn,
+    )
+    return train_loader, val_loader
+
+
+def configure_logging(log_dir: Path) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "training.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file, mode="w", encoding="utf-8"),
+        ],
+    )
+
+
+def train_one_epoch(
+    model: DualEncoderMetricModel,
+    arcface: ArcMarginProduct,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    device: torch.device,
+    scaler: amp.GradScaler,
+    config: TrainConfig,
+    epoch: int,
+    vis: VisdomLogger,
+) -> Tuple[float, float]:
+    model.train()
+    arcface.train()
+    total_loss = 0.0
+    total_acc = 0.0
+    total_samples = 0
+    ce_loss_fn = nn.CrossEntropyLoss()
+
+    for step, batch in enumerate(train_loader):
+        spot = batch["spot"].to(device, non_blocking=True)
+        global_img = batch["global"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with amp.autocast(enabled=config.amp):
+            embeddings, _ = model(spot, global_img)
+            logits = arcface(embeddings, labels)
+            ce_loss = ce_loss_fn(logits, labels)
+            triplet_loss = batch_hard_triplet_loss(embeddings, labels, margin=config.triplet_margin)
+            loss = ce_loss + config.triplet_weight * triplet_loss
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(arcface.parameters(), max_norm=5.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        preds = torch.argmax(logits.detach(), dim=1)
+        batch_size = labels.size(0)
+        total_loss += loss.item() * batch_size
+        total_acc += (preds == labels).sum().item()
+        total_samples += batch_size
+
+        global_step = epoch * len(train_loader) + step
+        vis.log_scalar("train_loss", global_step, loss.item())
+        vis.log_scalar("train_accuracy", global_step, (preds == labels).float().mean().item())
+
+    avg_loss = total_loss / max(total_samples, 1)
+    avg_acc = total_acc / max(total_samples, 1)
+    return avg_loss, avg_acc
+
+
+def evaluate(
+    model: DualEncoderMetricModel,
+    arcface: ArcMarginProduct,
+    data_loader: DataLoader,
+    device: torch.device,
+    config: TrainConfig,
+    epoch: int,
+    vis: VisdomLogger,
+) -> Tuple[float, float]:
+    model.eval()
+    arcface.eval()
+    ce_loss_fn = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_acc = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for step, batch in enumerate(data_loader):
+            spot = batch["spot"].to(device, non_blocking=True)
+            global_img = batch["global"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+
+            embeddings, _ = model(spot, global_img)
+            logits = arcface(embeddings, labels)
+            ce_loss = ce_loss_fn(logits, labels)
+            triplet_loss = batch_hard_triplet_loss(embeddings, labels, margin=config.triplet_margin)
+            loss = ce_loss + config.triplet_weight * triplet_loss
+
+            preds = torch.argmax(arcface.inference(embeddings), dim=1)
+            batch_size = labels.size(0)
+            total_loss += loss.item() * batch_size
+            total_acc += (preds == labels).sum().item()
+            total_samples += batch_size
+
+            global_step = epoch * len(data_loader) + step
+            vis.log_scalar("val_loss", global_step, loss.item())
+            vis.log_scalar("val_accuracy", global_step, (preds == labels).float().mean().item())
+
+    avg_loss = total_loss / max(total_samples, 1)
+    avg_acc = total_acc / max(total_samples, 1)
+    return avg_loss, avg_acc
+
+
+def run_training(config: TrainConfig) -> None:
+    set_seed()
+    configure_logging(config.log_dir)
+    device = torch.device(config.device)
+    dataset = SpotDataset(config.data_dir)
+    folds = create_stratified_folds(dataset.labels.tolist(), config.fold_count)
+    vis_logger = VisdomLogger(env=config.visdom_env)
+
+    fold_metrics: List[Dict[str, float]] = []
+
+    for fold_idx in range(config.fold_count):
+        val_indices = folds[fold_idx]
+        train_indices = [idx for i, fold in enumerate(folds) if i != fold_idx for idx in fold]
+
+        if not val_indices:
+            LOGGER.warning("Fold %d has no validation samples; skipping", fold_idx + 1)
+            continue
+        if not train_indices:
+            LOGGER.warning("Fold %d has no training samples; skipping", fold_idx + 1)
+            continue
+
+        LOGGER.info("Starting fold %d/%d (train=%d, val=%d)", fold_idx + 1, config.fold_count, len(train_indices), len(val_indices))
+        train_loader, val_loader = create_dataloaders(dataset, train_indices, val_indices, config)
+
+        model = DualEncoderMetricModel().to(device)
+        arcface = ArcMarginProduct(in_features=256, out_features=dataset.num_classes).to(device)
+
+        optimizer = torch.optim.AdamW(
+            list(model.parameters()) + list(arcface.parameters()),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs * len(train_loader))
+        scaler = amp.GradScaler(enabled=config.amp)
+
+        best_val_acc = 0.0
+        best_epoch = -1
+
+        for epoch in range(config.num_epochs):
+            train_loss, train_acc = train_one_epoch(
+                model, arcface, train_loader, optimizer, scheduler, device, scaler, config, epoch, vis_logger
+            )
+            val_loss, val_acc = evaluate(model, arcface, val_loader, device, config, epoch, vis_logger)
+
+            LOGGER.info(
+                "Fold %d | Epoch %d/%d | train_loss=%.4f | train_acc=%.3f | val_loss=%.4f | val_acc=%.3f",
+                fold_idx + 1,
+                epoch + 1,
+                config.num_epochs,
+                train_loss,
+                train_acc,
+                val_loss,
+                val_acc,
+            )
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_epoch = epoch
+                checkpoint_dir = config.log_dir / f"fold_{fold_idx + 1}"
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "arcface_state": arcface.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "config": config.__dict__,
+                    "epoch": epoch,
+                    "val_acc": val_acc,
+                }, checkpoint_dir / "best.pt")
+
+        LOGGER.info("Fold %d completed. Best val acc=%.3f at epoch %d", fold_idx + 1, best_val_acc, best_epoch + 1)
+        fold_metrics.append({"fold": fold_idx + 1, "val_acc": best_val_acc})
+
+    summary = "\n".join(f"Fold {m['fold']}: val_acc={m['val_acc']:.3f}" for m in fold_metrics)
+    overall = sum(m["val_acc"] for m in fold_metrics) / max(len(fold_metrics), 1)
+    LOGGER.info("Training finished.\n%s\nAverage accuracy: %.3f", summary, overall)
+    vis_logger.log_text("summary", f"Training finished\n{summary}\nAverage accuracy: {overall:.3f}")
+
+
+if __name__ == "main":
+    raise SystemExit("Use `python train.py` to start training.")
+
+
+if __name__ == "__main__":
+    cfg = parse_args()
+    run_training(cfg)
