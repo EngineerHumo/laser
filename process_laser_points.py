@@ -13,7 +13,7 @@ except ImportError:  # pragma: no cover - Pillow is optional.
 
 LOGGER = logging.getLogger(__name__)
 
-Point = Tuple[float, float, str]
+Rectangle = Tuple[float, float, float, float, str]
 
 
 @dataclass
@@ -113,6 +113,40 @@ class SimpleBmpImage:
                 if (x - cx) ** 2 + (y - cy) ** 2 <= radius_sq:
                     self._set_pixel(x, y, color)
 
+    def draw_rectangle(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        color: Tuple[int, int, int],
+        thickness: int = 1,
+    ) -> None:
+        if thickness <= 0:
+            return
+        x_start = max(0, int(math.floor(min(x0, x1))))
+        x_end = min(self.width - 1, int(math.ceil(max(x0, x1))))
+        y_start = max(0, int(math.floor(min(y0, y1))))
+        y_end = min(self.height - 1, int(math.ceil(max(y0, y1))))
+        if x_end < x_start or y_end < y_start:
+            return
+        thickness = int(thickness)
+        for offset in range(thickness):
+            top = y_start + offset
+            bottom = y_end - offset
+            if top > bottom:
+                break
+            for x in range(x_start, x_end + 1):
+                self._set_pixel(x, top, color)
+                self._set_pixel(x, bottom, color)
+            left = x_start + offset
+            right = x_end - offset
+            if left > right:
+                break
+            for y in range(top, bottom + 1):
+                self._set_pixel(left, y, color)
+                self._set_pixel(right, y, color)
+
     def save(self, output_path: Path) -> None:
         with output_path.open("wb") as fh:
             fh.write(self.header)
@@ -132,38 +166,39 @@ def iter_json_files(root: Path) -> Iterable[Path]:
     yield from sorted(path for path in root.glob("*.json") if path.is_file())
 
 
-def load_points(annotation: dict) -> List[Point]:
+def load_rectangles(annotation: dict) -> List[Rectangle]:
     points = annotation.get("points") or []
     if not points:
         return []
     xs, ys = zip(*points)
-    centroid = (sum(xs) / len(xs), sum(ys) / len(ys))
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
     label = str(annotation.get("label", ""))
-    return [(centroid[0], centroid[1], label)]
+    return [(min_x, min_y, max_x, max_y, label)]
 
 
-def draw_with_pillow(image_path: Path, points: Iterable[Point], output_path: Path) -> None:
+def draw_with_pillow(image_path: Path, rectangles: Iterable[Rectangle], output_path: Path) -> None:
     if Image is None:
         raise RuntimeError("Pillow backend is not available")
     with Image.open(image_path) as image:  # type: ignore[call-arg]
         image = image.convert("RGB")
         draw = ImageDraw.Draw(image)
         font = ImageFont.load_default()
-        radius = max(2, round(min(image.size) * 0.01))
-        for x, y, label in points:
-            bbox = (x - radius, y - radius, x + radius, y + radius)
-            draw.ellipse(bbox, outline="red", fill="red")
+        thickness = max(1, round(min(image.size) * 0.005))
+        for x0, y0, x1, y1, label in rectangles:
+            bbox = (x0, y0, x1, y1)
+            draw.rectangle(bbox, outline="red", width=thickness)
             if label:
-                draw.text((x + radius + 2, y - radius - 2), label, fill="yellow", font=font)
+                draw.text((x0, max(y0 - thickness * 2, 0)), label, fill="yellow", font=font)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(output_path)
 
 
-def draw_with_builtin(image_path: Path, points: Iterable[Point], output_path: Path) -> None:
+def draw_with_builtin(image_path: Path, rectangles: Iterable[Rectangle], output_path: Path) -> None:
     bmp = SimpleBmpImage.open(image_path)
-    radius = max(2, round(min(bmp.width, bmp.height) * 0.01))
-    for x, y, _label in points:
-        bmp.draw_filled_circle(x, y, radius, (255, 0, 0))
+    thickness = max(1, round(min(bmp.width, bmp.height) * 0.005))
+    for x0, y0, x1, y1, _label in rectangles:
+        bmp.draw_rectangle(x0, y0, x1, y1, (255, 0, 0), thickness)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     bmp.save(output_path)
 
@@ -172,19 +207,20 @@ def process_file(json_path: Path, image_path: Path, output_dir: Path) -> Optiona
     with json_path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
     shapes = data.get("shapes") or []
-    points: List[Point] = []
+    rectangles: List[Rectangle] = []
     for shape in shapes:
-        points.extend(load_points(shape))
+        rectangles.extend(load_rectangles(shape))
 
     if not image_path.exists():
         raise FileNotFoundError(f"Missing image file for {json_path.name}: {image_path}")
 
-    output_path = output_dir / image_path.name
+    output_filename = f"{image_path.stem}——masked{image_path.suffix}"
+    output_path = output_dir / output_filename
     try:
         if Image is not None:
-            draw_with_pillow(image_path, points, output_path)
+            draw_with_pillow(image_path, rectangles, output_path)
         else:
-            draw_with_builtin(image_path, points, output_path)
+            draw_with_builtin(image_path, rectangles, output_path)
     except Exception as exc:  # pragma: no cover - defensive programming
         LOGGER.error("Failed to process %s: %s", json_path.name, exc)
         return None
