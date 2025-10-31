@@ -91,7 +91,13 @@ class SpotDataset(Dataset[SpotSample]):
             raise RuntimeError(f"No valid entries found in {self.labels_path}")
 
         self._labels = torch.tensor([label for _, label in self.entries], dtype=torch.long)
-        self._num_classes = len(self.class_to_indices)
+        # ``labels.txt`` may contain non-contiguous class ids (e.g. ``0, 1, 3, 5``).
+        # ``ArcMarginProduct`` expects ``out_features`` to be at least ``max(label) + 1``;
+        # using the number of unique labels underestimates the class count in that case
+        # and leads to index errors when constructing one-hot targets. We therefore base
+        # ``num_classes`` on the maximum label value instead of the number of unique
+        # classes to guarantee compatibility with downstream losses.
+        self._num_classes = int(self._labels.max().item()) + 1
 
     @property
     def labels(self) -> Tensor:
