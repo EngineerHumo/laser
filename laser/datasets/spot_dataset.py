@@ -67,14 +67,23 @@ def _default_spot_transform() -> SpotTransform:
     return build_spot_transform(augment=False)
 
 
-def _default_global_transform() -> SpotTransform:
+def build_global_transform(output_size: int = 128) -> SpotTransform:
+    """Create the transformation pipeline for global context images."""
+
+    if output_size <= 0:
+        raise ValueError("output_size must be a positive integer")
+
     return transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Lambda(lambda tensor: F.adaptive_avg_pool2d(tensor, (128, 128))),
+            transforms.Lambda(lambda tensor: F.adaptive_avg_pool2d(tensor, (output_size, output_size))),
             transforms.Normalize(mean=SPOT_MEAN, std=SPOT_STD),
         ]
     )
+
+
+def _default_global_transform() -> SpotTransform:
+    return build_global_transform()
 
 
 class SpotDataset(Dataset[SpotSample]):
