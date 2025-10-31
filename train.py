@@ -220,6 +220,7 @@ def train_one_epoch(
             ce_loss = ce_loss_fn(logits, labels)
             triplet_loss = batch_hard_triplet_loss(embeddings, labels, margin=config.triplet_margin)
             loss = ce_loss + config.triplet_weight * triplet_loss
+            #loss = ce_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -273,8 +274,10 @@ def evaluate(
             embeddings, _ = model(spot, global_img)
             logits = arcface(embeddings, labels)
             ce_loss = ce_loss_fn(logits, labels)
+
             triplet_loss = batch_hard_triplet_loss(embeddings, labels, margin=config.triplet_margin)
             loss = ce_loss + config.triplet_weight * triplet_loss
+            #loss = ce_loss  
 
             preds = torch.argmax(arcface.inference(embeddings), dim=1)
             batch_size = labels.size(0)
