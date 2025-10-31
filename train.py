@@ -13,9 +13,18 @@ import numpy as np
 import torch
 from torch import nn
 from torch.cuda import amp
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
-from laser.datasets import SpotDataset, SpotSample, create_stratified_folds
+from laser.datasets import (
+    SPOT_MEAN,
+    SPOT_STD,
+    SpotDataset,
+    SpotSample,
+    SpotSubsetDataset,
+    build_global_transform,
+    build_spot_transform,
+    create_stratified_folds,
+)
 from laser.models import DualEncoderMetricModel
 from laser.models.losses import ArcMarginProduct, batch_hard_triplet_loss
 from laser.utils import VisdomLogger
@@ -27,8 +36,8 @@ LOGGER = logging.getLogger("train")
 class TrainConfig:
     data_dir: Path
     batch_size: int = 64
-    num_epochs: int = 30
-    learning_rate: float = 1e-3
+    num_epochs: int = 300
+    learning_rate: float = 5e-4
     weight_decay: float = 1e-4
     num_workers: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -44,8 +53,8 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train deep metric learning model for spot grading")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -90,9 +99,28 @@ def collate_fn(batch: Iterable[SpotSample]) -> Dict[str, torch.Tensor]:
     return {"spot": spot, "global": global_img, "labels": labels}
 
 
-def create_dataloaders(dataset: SpotDataset, train_indices: List[int], val_indices: List[int], config: TrainConfig) -> Tuple[DataLoader, DataLoader]:
-    train_subset = Subset(dataset, train_indices)
-    val_subset = Subset(dataset, val_indices)
+def create_dataloaders(
+    dataset: SpotDataset,
+    train_indices: List[int],
+    val_indices: List[int],
+    config: TrainConfig,
+) -> Tuple[DataLoader, DataLoader]:
+    train_spot_transform = build_spot_transform(augment=True)
+    eval_spot_transform = build_spot_transform(augment=False)
+    global_transform = build_global_transform()
+
+    train_subset = SpotSubsetDataset(
+        dataset,
+        train_indices,
+        spot_transform=train_spot_transform,
+        global_transform=global_transform,
+    )
+    val_subset = SpotSubsetDataset(
+        dataset,
+        val_indices,
+        spot_transform=eval_spot_transform,
+        global_transform=global_transform,
+    )
 
     train_loader = DataLoader(
         train_subset,
@@ -150,6 +178,15 @@ def train_one_epoch(
         spot = batch["spot"].to(device, non_blocking=True)
         global_img = batch["global"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
+
+        if step == 0:
+            vis.log_images(
+                "train_spot_batch",
+                spot[: min(16, spot.size(0))],
+                nrow=4,
+                mean=SPOT_MEAN,
+                std=SPOT_STD,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         with amp.autocast(enabled=config.amp):
@@ -250,7 +287,7 @@ def run_training(config: TrainConfig) -> None:
         train_loader, val_loader = create_dataloaders(dataset, train_indices, val_indices, config)
 
         model = DualEncoderMetricModel().to(device)
-        arcface = ArcMarginProduct(in_features=256, out_features=dataset.num_classes).to(device)
+        arcface = ArcMarginProduct(in_features=512, out_features=dataset.num_classes).to(device)
 
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(arcface.parameters()),

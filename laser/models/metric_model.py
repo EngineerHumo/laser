@@ -18,8 +18,8 @@ class DualEncoderMetricModel(nn.Module):
         spot_embedding_dim: int = 256,
         global_feature_dim: int = 192,
         attention_dim: int = 128,
-        context_dim: int = 160,
-        output_embedding_dim: int = 256,
+        context_dim: int = 256,
+        output_embedding_dim: int = 512,
     ) -> None:
         super().__init__()
         self.spot_encoder = SpotEncoder(embedding_dim=spot_embedding_dim)
@@ -29,13 +29,22 @@ class DualEncoderMetricModel(nn.Module):
         self.key_proj = nn.Linear(global_feature_dim, attention_dim)
         self.value_proj = nn.Linear(global_feature_dim, context_dim)
 
+        fusion_dim = spot_embedding_dim + context_dim
+        if fusion_dim != 512:
+            raise ValueError(
+                "The concatenated fusion features must be 512-D; "
+                f"got {fusion_dim}. Adjust spot/context dimensions accordingly."
+            )
+
         self.fusion = nn.Sequential(
-            nn.Linear(spot_embedding_dim + context_dim, 512),
+            nn.Linear(fusion_dim, 512),
             nn.BatchNorm1d(512),
             nn.SiLU(inplace=True),
             nn.Dropout(p=0.2),
             nn.Linear(512, output_embedding_dim),
             nn.BatchNorm1d(output_embedding_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(p=0.1),
         )
 
     def forward(self, spot: torch.Tensor, global_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

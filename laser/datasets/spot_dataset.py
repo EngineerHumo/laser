@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,24 +31,59 @@ class SpotSample:
     global_name: str
 
 
+SPOT_MEAN = [0.485, 0.456, 0.406]
+SPOT_STD = [0.229, 0.224, 0.225]
+
+
+def build_spot_transform(augment: bool = False) -> SpotTransform:
+    """Create the transformation pipeline for spot crops."""
+
+    transforms_list = [transforms.Resize((64, 64), interpolation=InterpolationMode.BILINEAR)]
+
+    if augment:
+        transforms_list.extend(
+            [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomRotation(
+                    degrees=90,
+                    interpolation=InterpolationMode.BILINEAR,
+                    expand=False,
+                    fill=0,
+                ),
+            ]
+        )
+
+    transforms_list.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=SPOT_MEAN, std=SPOT_STD),
+        ]
+    )
+    return transforms.Compose(transforms_list)
+
+
 def _default_spot_transform() -> SpotTransform:
+    return build_spot_transform(augment=False)
+
+
+def build_global_transform(output_size: int = 128) -> SpotTransform:
+    """Create the transformation pipeline for global context images."""
+
+    if output_size <= 0:
+        raise ValueError("output_size must be a positive integer")
+
     return transforms.Compose(
         [
-            transforms.Resize((64, 64)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Lambda(lambda tensor: F.adaptive_avg_pool2d(tensor, (output_size, output_size))),
+            transforms.Normalize(mean=SPOT_MEAN, std=SPOT_STD),
         ]
     )
 
 
 def _default_global_transform() -> SpotTransform:
-    return transforms.Compose(
-        [
-            transforms.Resize((128, 128)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    return build_global_transform()
 
 
 class SpotDataset(Dataset[SpotSample]):
@@ -118,6 +155,18 @@ class SpotDataset(Dataset[SpotSample]):
         return len(self.entries)
 
     def __getitem__(self, index: int) -> SpotSample:
+        return self.load_sample(index)
+
+    def load_sample(
+        self,
+        index: int,
+        *,
+        spot_transform: Optional[SpotTransform] = None,
+        global_transform: Optional[SpotTransform] = None,
+    ) -> SpotSample:
+        spot_transform = spot_transform or self.spot_transform
+        global_transform = global_transform or self.global_transform
+
         spot_name, label = self.entries[index]
         spot_path = self.spot_dir / f"{spot_name}.png"
         global_name = spot_name.split("_")[0]
@@ -130,11 +179,11 @@ class SpotDataset(Dataset[SpotSample]):
 
         with Image.open(spot_path) as spot_img:
             spot_img = spot_img.convert("RGB")
-            spot_tensor = self.spot_transform(spot_img)
+            spot_tensor = spot_transform(spot_img)
 
         with Image.open(global_path) as global_img:
             global_img = global_img.convert("RGB")
-            global_tensor = self.global_transform(global_img)
+            global_tensor = global_transform(global_img)
 
         return SpotSample(
             spot_image=spot_tensor,
@@ -142,6 +191,34 @@ class SpotDataset(Dataset[SpotSample]):
             label=label,
             spot_name=spot_name,
             global_name=global_name,
+        )
+
+
+class SpotSubsetDataset(Dataset[SpotSample]):
+    """Subset view of :class:`SpotDataset` with dedicated transforms."""
+
+    def __init__(
+        self,
+        dataset: SpotDataset,
+        indices: Sequence[int],
+        *,
+        spot_transform: Optional[SpotTransform] = None,
+        global_transform: Optional[SpotTransform] = None,
+    ) -> None:
+        self.dataset = dataset
+        self.indices = list(indices)
+        self.spot_transform = spot_transform
+        self.global_transform = global_transform
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> SpotSample:
+        base_index = self.indices[index]
+        return self.dataset.load_sample(
+            base_index,
+            spot_transform=self.spot_transform,
+            global_transform=self.global_transform,
         )
 
 
