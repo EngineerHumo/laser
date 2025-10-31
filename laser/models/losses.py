@@ -45,7 +45,8 @@ class ArcMarginProduct(nn.Module):
             phi = torch.where(cosine > 0, phi, cosine)
         else:
             phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-
+        #print(label)
+        #print(self.out_features)
         one_hot = F.one_hot(label, num_classes=self.out_features).float()
         logits = (one_hot * phi) + ((1.0 - one_hot) * cosine)
         logits *= self.s

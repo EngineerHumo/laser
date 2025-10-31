@@ -119,6 +119,7 @@ def process_dataset(origin_dir: Path, output_dir: Path, overwrite_labels: bool =
     image_dir, spot_dir, label_path = _ensure_directories(output_dir)
 
     json_files = sorted(origin_dir.glob("*.json"))
+    print(origin_dir)
     if not json_files:
         LOGGER.error("No JSON files found in %s", origin_dir)
         raise FileNotFoundError(f"No JSON files found in {origin_dir}")
