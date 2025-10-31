@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import logging
 import random
 from dataclasses import dataclass
@@ -47,6 +48,15 @@ class TrainConfig:
     log_dir: Path = Path("logs")
     fold_count: int = 5
     amp: bool = True
+
+
+@dataclass
+class EvalMetrics:
+    loss: float
+    accuracy: float
+    per_class_accuracy: Dict[int, float]
+    class_counts: Dict[int, int]
+    confusion_matrix: torch.Tensor
 
 
 def parse_args() -> TrainConfig:
@@ -94,9 +104,10 @@ def set_seed(seed: int = 42) -> None:
 def collate_fn(batch: Iterable[SpotSample]) -> Dict[str, torch.Tensor]:
     batch_list = list(batch)
     spot = torch.stack([item.spot_image for item in batch_list])
+    spot_context = torch.stack([item.spot_context_image for item in batch_list])
     global_img = torch.stack([item.global_image for item in batch_list])
     labels = torch.tensor([item.label for item in batch_list], dtype=torch.long)
-    return {"spot": spot, "global": global_img, "labels": labels}
+    return {"spot": spot, "spot_context": spot_context, "global": global_img, "labels": labels}
 
 
 def create_dataloaders(
@@ -175,18 +186,32 @@ def train_one_epoch(
     ce_loss_fn = nn.CrossEntropyLoss()
 
     for step, batch in enumerate(train_loader):
-        spot = batch["spot"].to(device, non_blocking=True)
+        spot_context_batch = batch["spot_context"]
+        spot_batch = batch["spot"]
+        labels_batch = batch["labels"]
+
+        spot = spot_batch.to(device, non_blocking=True)
         global_img = batch["global"].to(device, non_blocking=True)
-        labels = batch["labels"].to(device, non_blocking=True)
+        labels = labels_batch.to(device, non_blocking=True)
 
         if step == 0:
+            num_vis = min(16, spot_batch.size(0))
             vis.log_images(
-                "train_spot_batch",
-                spot[: min(16, spot.size(0))],
+                "train_spot_64",
+                spot_batch[:num_vis],
                 nrow=4,
                 mean=SPOT_MEAN,
                 std=SPOT_STD,
             )
+            vis.log_images(
+                "train_spot_context_128",
+                spot_context_batch[:num_vis],
+                nrow=4,
+                mean=SPOT_MEAN,
+                std=SPOT_STD,
+            )
+            label_lines = [f"Epoch {epoch + 1} | Sample {i + 1}: class {int(label)}" for i, label in enumerate(labels_batch[:num_vis])]
+            vis.log_text("train_spot_labels", "<br>".join(label_lines) + "<br><br>")
 
         optimizer.zero_grad(set_to_none=True)
         with amp.autocast(enabled=config.amp):
@@ -227,13 +252,17 @@ def evaluate(
     config: TrainConfig,
     epoch: int,
     vis: VisdomLogger,
-) -> Tuple[float, float]:
+) -> EvalMetrics:
     model.eval()
     arcface.eval()
     ce_loss_fn = nn.CrossEntropyLoss()
     total_loss = 0.0
     total_acc = 0.0
     total_samples = 0
+    num_classes = arcface.out_features
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    class_totals = torch.zeros(num_classes, dtype=torch.long)
+    class_correct = torch.zeros(num_classes, dtype=torch.long)
 
     with torch.no_grad():
         for step, batch in enumerate(data_loader):
@@ -253,13 +282,38 @@ def evaluate(
             total_acc += (preds == labels).sum().item()
             total_samples += batch_size
 
+            labels_cpu = labels.cpu()
+            preds_cpu = preds.cpu()
+            for actual, predicted in zip(labels_cpu.tolist(), preds_cpu.tolist()):
+                confusion[actual, predicted] += 1
+            class_totals += torch.bincount(labels_cpu, minlength=num_classes)
+            matches = preds_cpu == labels_cpu
+            if matches.any():
+                class_correct += torch.bincount(labels_cpu[matches], minlength=num_classes)
+
             global_step = epoch * len(data_loader) + step
             vis.log_scalar("val_loss", global_step, loss.item())
             vis.log_scalar("val_accuracy", global_step, (preds == labels).float().mean().item())
 
     avg_loss = total_loss / max(total_samples, 1)
     avg_acc = total_acc / max(total_samples, 1)
-    return avg_loss, avg_acc
+    per_class_accuracy: Dict[int, float] = {}
+    class_counts: Dict[int, int] = {}
+    for cls_idx in range(num_classes):
+        total = int(class_totals[cls_idx].item())
+        class_counts[cls_idx] = total
+        if total == 0:
+            per_class_accuracy[cls_idx] = float("nan")
+        else:
+            per_class_accuracy[cls_idx] = float(class_correct[cls_idx].item()) / total
+
+    return EvalMetrics(
+        loss=avg_loss,
+        accuracy=avg_acc,
+        per_class_accuracy=per_class_accuracy,
+        class_counts=class_counts,
+        confusion_matrix=confusion,
+    )
 
 
 def run_training(config: TrainConfig) -> None:
@@ -304,7 +358,9 @@ def run_training(config: TrainConfig) -> None:
             train_loss, train_acc = train_one_epoch(
                 model, arcface, train_loader, optimizer, scheduler, device, scaler, config, epoch, vis_logger
             )
-            val_loss, val_acc = evaluate(model, arcface, val_loader, device, config, epoch, vis_logger)
+            val_metrics = evaluate(model, arcface, val_loader, device, config, epoch, vis_logger)
+            val_loss = val_metrics.loss
+            val_acc = val_metrics.accuracy
 
             LOGGER.info(
                 "Fold %d | Epoch %d/%d | train_loss=%.4f | train_acc=%.3f | val_loss=%.4f | val_acc=%.3f",
@@ -315,6 +371,35 @@ def run_training(config: TrainConfig) -> None:
                 train_acc,
                 val_loss,
                 val_acc,
+            )
+
+            per_class_log = ", ".join(
+                (
+                    f"class {cls}: {acc:.3f} ({val_metrics.class_counts.get(cls, 0)} samples)"
+                    if not math.isnan(acc)
+                    else f"class {cls}: N/A ({val_metrics.class_counts.get(cls, 0)} samples)"
+                )
+                for cls, acc in sorted(val_metrics.per_class_accuracy.items())
+            )
+            LOGGER.info(
+                "Fold %d | Epoch %d | Validation per-class accuracy: %s",
+                fold_idx + 1,
+                epoch + 1,
+                per_class_log,
+            )
+            confusion_array = val_metrics.confusion_matrix.cpu().numpy()
+            confusion_rows = ["\t".join(f"{int(value):d}" for value in row) for row in confusion_array]
+            header = "\t".join(str(cls) for cls in range(confusion_array.shape[1]))
+            matrix_lines = ["Predicted", "\t" + header]
+            matrix_lines.extend(
+                f"{cls}\t" + row for cls, row in zip(range(confusion_array.shape[0]), confusion_rows)
+            )
+            matrix_text = "\n".join(matrix_lines)
+            LOGGER.info(
+                "Fold %d | Epoch %d | Confusion matrix (rows=gt, cols=pred):\n%s",
+                fold_idx + 1,
+                epoch + 1,
+                matrix_text,
             )
 
             if val_acc > best_val_acc:

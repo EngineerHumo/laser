@@ -8,23 +8,21 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 LOGGER = logging.getLogger(__name__)
-
-SpotTransform = Callable[[Image.Image], Tensor]
-
 
 @dataclass
 class SpotSample:
     """Container returned by :class:`SpotDataset`."""
 
     spot_image: Tensor
+    spot_context_image: Tensor
     global_image: Tensor
     label: int
     spot_name: str
@@ -35,13 +33,22 @@ SPOT_MEAN = [0.485, 0.456, 0.406]
 SPOT_STD = [0.229, 0.224, 0.225]
 
 
+SpotTransform = Callable[[Image.Image], Tuple[Tensor, Tensor]]
+GlobalTransform = Callable[[Image.Image], Tensor]
+
+
 def build_spot_transform(augment: bool = False) -> SpotTransform:
-    """Create the transformation pipeline for spot crops."""
+    """Create the transformation pipeline for spot crops.
 
-    transforms_list = [transforms.Resize((64, 64), interpolation=InterpolationMode.BILINEAR)]
+    The returned callable resizes the image to ``128x128`` pixels, applies
+    optional augmentations and yields both the ``64x64`` centre crop (used for
+    training) and the full ``128x128`` crop (used for visualisation).
+    """
 
+    resize = transforms.Resize((128, 128), interpolation=InterpolationMode.BILINEAR)
+    augmentation: Optional[transforms.Compose]
     if augment:
-        transforms_list.extend(
+        augmentation = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
@@ -53,21 +60,28 @@ def build_spot_transform(augment: bool = False) -> SpotTransform:
                 ),
             ]
         )
+    else:
+        augmentation = None
 
-    transforms_list.extend(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=SPOT_MEAN, std=SPOT_STD),
-        ]
-    )
-    return transforms.Compose(transforms_list)
+    to_tensor = transforms.ToTensor()
+    normalise = transforms.Normalize(mean=SPOT_MEAN, std=SPOT_STD)
+
+    def transform(image: Image.Image) -> Tuple[Tensor, Tensor]:
+        image = resize(image)
+        if augmentation is not None:
+            image = augmentation(image)
+        context_tensor = normalise(to_tensor(image))
+        spot_tensor = TF.center_crop(context_tensor, (64, 64))
+        return spot_tensor, context_tensor
+
+    return transform
 
 
 def _default_spot_transform() -> SpotTransform:
     return build_spot_transform(augment=False)
 
 
-def build_global_transform(output_size: int = 128) -> SpotTransform:
+def build_global_transform(output_size: int = 128) -> Callable[[Image.Image], Tensor]:
     """Create the transformation pipeline for global context images."""
 
     if output_size <= 0:
@@ -75,14 +89,14 @@ def build_global_transform(output_size: int = 128) -> SpotTransform:
 
     return transforms.Compose(
         [
+            transforms.Resize((output_size, output_size), interpolation=InterpolationMode.BILINEAR),
             transforms.ToTensor(),
-            transforms.Lambda(lambda tensor: F.adaptive_avg_pool2d(tensor, (output_size, output_size))),
             transforms.Normalize(mean=SPOT_MEAN, std=SPOT_STD),
         ]
     )
 
 
-def _default_global_transform() -> SpotTransform:
+def _default_global_transform() -> GlobalTransform:
     return build_global_transform()
 
 
@@ -93,7 +107,7 @@ class SpotDataset(Dataset[SpotSample]):
         self,
         root: Path | str = Path("data"),
         spot_transform: Optional[SpotTransform] = None,
-        global_transform: Optional[SpotTransform] = None,
+        global_transform: Optional[GlobalTransform] = None,
     ) -> None:
         self.root = Path(root)
         self.spot_dir = self.root / "spot"
@@ -162,7 +176,7 @@ class SpotDataset(Dataset[SpotSample]):
         index: int,
         *,
         spot_transform: Optional[SpotTransform] = None,
-        global_transform: Optional[SpotTransform] = None,
+        global_transform: Optional[GlobalTransform] = None,
     ) -> SpotSample:
         spot_transform = spot_transform or self.spot_transform
         global_transform = global_transform or self.global_transform
@@ -179,7 +193,7 @@ class SpotDataset(Dataset[SpotSample]):
 
         with Image.open(spot_path) as spot_img:
             spot_img = spot_img.convert("RGB")
-            spot_tensor = spot_transform(spot_img)
+            spot_tensor, spot_context_tensor = spot_transform(spot_img)
 
         with Image.open(global_path) as global_img:
             global_img = global_img.convert("RGB")
@@ -187,6 +201,7 @@ class SpotDataset(Dataset[SpotSample]):
 
         return SpotSample(
             spot_image=spot_tensor,
+            spot_context_image=spot_context_tensor,
             global_image=global_tensor,
             label=label,
             spot_name=spot_name,
@@ -203,7 +218,7 @@ class SpotSubsetDataset(Dataset[SpotSample]):
         indices: Sequence[int],
         *,
         spot_transform: Optional[SpotTransform] = None,
-        global_transform: Optional[SpotTransform] = None,
+        global_transform: Optional[GlobalTransform] = None,
     ) -> None:
         self.dataset = dataset
         self.indices = list(indices)
