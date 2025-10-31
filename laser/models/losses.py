@@ -73,17 +73,44 @@ def batch_hard_triplet_loss(
 
     pairwise_dist = torch.cdist(embeddings, embeddings, p=2)
     label_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
-    mask_pos = label_matrix ^ torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
-    mask_neg = ~label_matrix
 
-    pos_dist = pairwise_dist.clone()
-    pos_dist[~mask_pos] = 0.0
-    hardest_pos = pos_dist.max(dim=1)[0]
+    batch_losses = []
+    for anchor_idx in range(embeddings.size(0)):
+        anchor_label = labels[anchor_idx]
+        pos_mask = label_matrix[anchor_idx].clone()
+        pos_mask[anchor_idx] = False
+        pos_indices = torch.nonzero(pos_mask, as_tuple=False).squeeze(1)
 
-    neg_dist = pairwise_dist.clone()
-    neg_dist[~mask_neg] = float("inf")
-    hardest_neg = neg_dist.min(dim=1)[0]
-    hardest_neg[~torch.isfinite(hardest_neg)] = 0.0
+        if pos_indices.numel() == 0:
+            continue
 
-    losses = F.relu(hardest_pos - hardest_neg + margin)
-    return losses.mean()
+        pos_dists = pairwise_dist[anchor_idx, pos_indices]
+        num_pos = min(3, pos_dists.size(0))
+        if pos_dists.size(0) > num_pos:
+            pos_dists, _ = torch.topk(pos_dists, k=num_pos, largest=True)
+
+        neg_labels = labels[labels != anchor_label].unique()
+        neg_dists_list = []
+
+        for neg_label in neg_labels:
+            neg_indices = torch.nonzero(labels == neg_label, as_tuple=False).squeeze(1)
+            if neg_indices.numel() == 0:
+                continue
+
+            neg_dists = pairwise_dist[anchor_idx, neg_indices]
+            num_neg = min(3, neg_dists.size(0))
+            if neg_dists.size(0) > num_neg:
+                neg_dists, _ = torch.topk(neg_dists, k=num_neg, largest=False)
+            neg_dists_list.append(neg_dists)
+
+        if not neg_dists_list:
+            continue
+
+        neg_dists = torch.cat(neg_dists_list, dim=0)
+        losses = F.relu(pos_dists.unsqueeze(1) - neg_dists.unsqueeze(0) + margin)
+        batch_losses.append(losses.reshape(-1))
+
+    if not batch_losses:
+        return embeddings.new_tensor(0.0)
+
+    return torch.cat(batch_losses).mean()
