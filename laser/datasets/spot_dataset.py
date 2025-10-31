@@ -91,7 +91,20 @@ class SpotDataset(Dataset[SpotSample]):
             raise RuntimeError(f"No valid entries found in {self.labels_path}")
 
         self._labels = torch.tensor([label for _, label in self.entries], dtype=torch.long)
-        self._num_classes = len(self.class_to_indices)
+
+        # ``len(class_to_indices)`` only counts classes that are present in the
+        # current dataset split. Some training runs expect the classifier head
+        # to allocate logits for every class defined in ``labels.txt`` even if
+        # a particular class is missing from the sampled data.  Relying on the
+        # observed class count therefore leads to ``out_features`` being too
+        # small when the labels are not contiguous (e.g. classes ``0-5`` with
+        # one class absent), which in turn triggers device-side asserts when
+        # constructing one-hot encodings.  Using the maximum label value keeps
+        # ``num_classes`` stable across runs.
+        max_label = int(self._labels.max().item())
+        if max_label < 0:
+            raise ValueError("labels.txt must contain non-negative class indices")
+        self._num_classes = max_label + 1
 
     @property
     def labels(self) -> Tensor:
