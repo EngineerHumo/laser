@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
+
+import torch
+from torchvision.utils import make_grid
 
 try:
     from visdom import Visdom  # type: ignore
@@ -51,3 +54,37 @@ class VisdomLogger:
             self.windows[name] = self.viz.text(text, opts={"title": name})
         else:
             self.viz.text(text, win=self.windows[name], append=True)
+
+    def log_images(
+        self,
+        name: str,
+        images: torch.Tensor,
+        *,
+        nrow: int = 8,
+        mean: Optional[Sequence[float]] = None,
+        std: Optional[Sequence[float]] = None,
+        clamp: bool = True,
+    ) -> None:
+        """Log an image grid to Visdom."""
+
+        if not self.enabled or self.viz is None:
+            return
+        if images.ndim != 4:
+            raise ValueError("Expected a 4D tensor (batch, channels, height, width)")
+
+        tensor = images.detach().cpu()
+        if mean is not None and std is not None:
+            mean_tensor = torch.tensor(mean, dtype=tensor.dtype).view(1, -1, 1, 1)
+            std_tensor = torch.tensor(std, dtype=tensor.dtype).view(1, -1, 1, 1)
+            tensor = tensor * std_tensor + mean_tensor
+
+        if clamp:
+            tensor = tensor.clamp(0.0, 1.0)
+
+        grid = make_grid(tensor, nrow=nrow)
+
+        if name not in self.windows:
+            self.windows[name] = self.viz.image(grid, opts={"title": name})
+        else:
+            self.viz.image(grid, win=self.windows[name])
+
