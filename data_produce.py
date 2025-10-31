@@ -2,9 +2,9 @@
 
 This script iterates over the ``origin_data`` directory, where each sample is
 stored as a pair of ``.json`` annotations and ``.bmp`` images. For every spot
-annotation inside a JSON file, a 64x64 crop centred on the annotated rectangle
-is extracted from the corresponding BMP image. The crops are saved into
-``data/spot`` and the class labels are written to ``data/labels.txt``.
+annotation inside a JSON file, a 128x128 crop centred on the annotated
+rectangle is extracted from the corresponding BMP image. The crops are saved
+into ``data/spot`` and the class labels are written to ``data/labels.txt``.
 
 After all spots of an image are processed, the whole BMP image is down-sampled
 using average pooling to ``128x128`` pixels and saved to ``data/image``.
@@ -17,7 +17,7 @@ The resulting directory layout will be::
 
     data/
         image/          # down-sampled 128x128 images
-        spot/           # 64x64 crops around each spot
+        spot/           # 128x128 crops around each spot
         labels.txt      # mapping between spot crops and grade labels
 
 The ``labels.txt`` file contains space separated ``<spot_name> <grade>`` pairs,
@@ -139,7 +139,7 @@ def process_dataset(origin_dir: Path, output_dir: Path, overwrite_labels: bool =
             LOGGER.info("Processing %s (%dx%d)", json_path.name, image.width, image.height)
 
             for index, center, grade in _load_annotation(json_path):
-                crop = _crop_with_padding(image, center, 64)
+                crop = _crop_with_padding(image, center, 128)
                 crop_name = f"{stem}_{index:03d}.png"
                 crop.save(spot_dir / crop_name)
                 label_file.write(f"{stem}_{index:03d} {grade}\n")
