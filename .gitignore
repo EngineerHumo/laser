@@ -105,6 +105,7 @@ ENV/
 *.pkl
 *.xml
 *.pdf
+*.pt
 *.pth
 *.onnx
 
