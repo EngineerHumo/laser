@@ -1,5 +1,6 @@
 """Dataset definitions for the spot grading project."""
 
+from .samplers import BalancedBatchSampler
 from .spot_dataset import (
     SPOT_MEAN,
     SPOT_STD,
@@ -15,6 +16,7 @@ __all__ = [
     "SpotDataset",
     "SpotSample",
     "SpotSubsetDataset",
+    "BalancedBatchSampler",
     "build_global_transform",
     "build_spot_transform",
     "create_stratified_folds",

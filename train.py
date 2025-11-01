@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from laser.datasets import (
     SPOT_MEAN,
     SPOT_STD,
+    BalancedBatchSampler,
     SpotDataset,
     SpotSample,
     SpotSubsetDataset,
@@ -133,10 +134,16 @@ def create_dataloaders(
         global_transform=global_transform,
     )
 
+    train_sampler = BalancedBatchSampler(
+        train_subset,
+        config.batch_size,
+        extra_classes=[0, 2, 3, 4, 5],
+        extras_per_class=2,
+    )
+
     train_loader = DataLoader(
         train_subset,
-        batch_size=config.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         num_workers=config.num_workers,
         pin_memory=config.device.startswith("cuda"),
         collate_fn=collate_fn,
