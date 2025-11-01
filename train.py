@@ -36,7 +36,7 @@ LOGGER = logging.getLogger("train")
 @dataclass
 class TrainConfig:
     data_dir: Path
-    batch_size: int = 64
+    batch_size: int = 128
     num_epochs: int = 300
     learning_rate: float = 5e-4
     weight_decay: float = 1e-4
@@ -62,7 +62,7 @@ class EvalMetrics:
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train deep metric learning model for spot grading")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)

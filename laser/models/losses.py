@@ -89,24 +89,18 @@ def batch_hard_triplet_loss(
         if pos_dists.size(0) > num_pos:
             pos_dists, _ = torch.topk(pos_dists, k=num_pos, largest=True)
 
-        neg_labels = labels[labels != anchor_label].unique()
-        neg_dists_list = []
+        neg_mask = labels != anchor_label
+        neg_indices = torch.nonzero(neg_mask, as_tuple=False).squeeze(1)
 
-        for neg_label in neg_labels:
-            neg_indices = torch.nonzero(labels == neg_label, as_tuple=False).squeeze(1)
-            if neg_indices.numel() == 0:
-                continue
-
-            neg_dists = pairwise_dist[anchor_idx, neg_indices]
-            num_neg = min(3, neg_dists.size(0))
-            if neg_dists.size(0) > num_neg:
-                neg_dists, _ = torch.topk(neg_dists, k=num_neg, largest=False)
-            neg_dists_list.append(neg_dists)
-
-        if not neg_dists_list:
+        if neg_indices.numel() == 0:
             continue
 
-        neg_dists = torch.cat(neg_dists_list, dim=0)
+        neg_dists = pairwise_dist[anchor_idx, neg_indices]
+        num_neg = min(3, neg_dists.size(0))
+        if neg_dists.size(0) > num_neg:
+            neg_dists, _ = torch.topk(neg_dists, k=num_neg, largest=False)
+        else:
+            neg_dists = neg_dists[:num_neg]
         losses = F.relu(pos_dists.unsqueeze(1) - neg_dists.unsqueeze(0) + margin)
         batch_losses.append(losses.reshape(-1))
 
