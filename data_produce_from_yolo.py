@@ -149,6 +149,12 @@ def process_split(
                 continue
 
             with Image.open(bmp_path) as image:
+                # ``load()`` ensures the BMP data is fully read once.  Without this call
+                # Pillow keeps the file handle open and lazily decodes tiles every time a
+                # crop is saved, which results in repeated I/O and heavy CPU usage when a
+                # single source image contains a lot of spots.  The eager load keeps the
+                # whole image in memory so that individual crops can be encoded quickly.
+                image.load()
                 image = image.convert("RGB")
                 LOGGER.debug(
                     "Split %s | %s (%dx%d)", split, bmp_path.name, image.width, image.height
@@ -157,16 +163,28 @@ def process_split(
                 annotation_iter = list(_load_annotation(json_path))
                 if not annotation_iter:
                     LOGGER.warning("No valid annotations in %s", json_path.name)
+                save_kwargs = {"format": "PNG", "compress_level": 1}
+
                 for index, center, grade in annotation_iter:
                     crop = _crop_with_padding(image, center, 128)
                     crop_name = f"{stem}_{index:03d}.png"
-                    crop.save(spot_output_dir / crop_name)
+                    crop.save(spot_output_dir / crop_name, **save_kwargs)
                     label_file.write(f"{stem}_{index:03d} {grade}\n")
                     total_spots += 1
 
                 downsampled = _downsample_to_128(image)
-                downsampled.save(image_output_dir / f"{stem}.png")
+                downsampled.save(
+                    image_output_dir / f"{stem}.png", format="PNG", compress_level=1
+                )
                 processed_images += 1
+
+                if processed_images % 50 == 0:
+                    LOGGER.info(
+                        "Split %s progress: %d images, %d crops",
+                        split,
+                        processed_images,
+                        total_spots,
+                    )
 
     LOGGER.info(
         "Finished split '%s': %d images, %d spot crops", split, processed_images, total_spots
