@@ -15,7 +15,8 @@ from .spot_dataset import SpotSubsetDataset
 LOGGER = logging.getLogger(__name__)
 
 
-class BalancedBatchSampler(BatchSampler[List[int]]):
+#class BalancedBatchSampler(BatchSampler[List[int]]):
+class BalancedBatchSampler(BatchSampler):
     """Batch sampler that appends extra samples for specific classes."""
 
     def __init__(
