@@ -1,27 +1,26 @@
-"""Data preparation utilities for spot classification dataset.
+"""Dataset preparation utilities for the fixed train/validation pipeline.
 
-This script iterates over the ``origin_data`` directory, where each sample is
-stored as a pair of ``.json`` annotations and ``.bmp`` images. For every spot
-annotation inside a JSON file, a 128x128 crop centred on the annotated
-rectangle is extracted from the corresponding BMP image. The crops are saved
-into ``data/spot`` and the class labels are written to ``data/labels.txt``.
+The dataset used by the training code is produced from the YOLO style
+annotations that live under ``yolo_data``.  Each ``.bmp`` file inside the
+``laser/images/<split>`` directory has a sibling ``.json`` file located in the
+root of ``yolo_data``.  The JSON document contains a ``shapes`` list, where
+every entry provides a ``label`` (grade name) and a ``points`` rectangle around
+an annotated spot.
 
-After all spots of an image are processed, the whole BMP image is down-sampled
-using average pooling to ``128x128`` pixels and saved to ``data/image``.
+For every annotation the script copies a ``128x128`` crop centred on the
+rectangle and stores it as ``data/<split>/spot/<image>_<spot>.png``.  The grades
+are stored in ``data/<split>/labels.txt`` keeping the ``<crop_name> <grade>``
+format used throughout the project.  Once all spots of an image are processed,
+the original BMP is average-pooled down to ``128x128`` pixels and saved as
+``data/<split>/image/<image>.png``.
 
-Example usage::
+Both the training and validation splits are generated in one go::
 
-    python data_produce.py --origin-dir origin_data --output-dir data
+    python data_produce_from_yolo.py --yolo-root /path/to/yolo_data \
+        --output-root data
 
-The resulting directory layout will be::
-
-    data/
-        image/          # down-sampled 128x128 images
-        spot/           # 128x128 crops around each spot
-        labels.txt      # mapping between spot crops and grade labels
-
-The ``labels.txt`` file contains space separated ``<spot_name> <grade>`` pairs,
-where grades follow the mapping specified in the user instructions.
+The script overwrites the output directories by default.  Use ``--keep-labels``
+when appending to existing label files is required.
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
 from PIL import Image, ImageOps
 
@@ -44,6 +43,8 @@ LABEL_TO_GRADE: Dict[str, int] = {
     "3": 4,
     "3+": 5,
 }
+
+DEFAULT_YOLO_ROOT = Path("/home/wensheng/gjq_workspace/laser/yolo_data")
 
 
 def _ensure_directories(base_dir: Path) -> Tuple[Path, Path, Path]:
@@ -111,48 +112,108 @@ def _load_annotation(path: Path) -> Iterable[Tuple[int, Tuple[float, float], int
 
 
 def _downsample_to_128(image: Image.Image) -> Image.Image:
-    # BOX filter corresponds to averaging when down-sampling.
+    """Down-sample ``image`` to ``128x128`` pixels using average pooling."""
+
     return image.resize((128, 128), resample=Image.BOX)
 
 
-def process_dataset(origin_dir: Path, output_dir: Path, overwrite_labels: bool = True) -> None:
-    image_dir, spot_dir, label_path = _ensure_directories(output_dir)
+def _iter_bmp_files(directory: Path) -> Iterator[Path]:
+    if not directory.exists():
+        raise FileNotFoundError(f"Image directory not found: {directory}")
+    return iter(sorted(directory.glob("*.bmp")))
 
-    json_files = sorted(origin_dir.glob("*.json"))
-    print(origin_dir)
-    if not json_files:
-        LOGGER.error("No JSON files found in %s", origin_dir)
-        raise FileNotFoundError(f"No JSON files found in {origin_dir}")
+
+def process_split(
+    *,
+    split: str,
+    image_dir: Path,
+    annotation_dir: Path,
+    output_dir: Path,
+    overwrite_labels: bool = True,
+) -> None:
+    LOGGER.info("Processing split '%s'", split)
+    image_output_dir, spot_output_dir, label_path = _ensure_directories(output_dir)
 
     if overwrite_labels and label_path.exists():
         label_path.unlink()
 
+    total_spots = 0
+    processed_images = 0
+
     with label_path.open("a", encoding="utf-8") as label_file:
-        for json_path in json_files:
-            stem = json_path.stem
-            bmp_path = origin_dir / f"{stem}.bmp"
-            if not bmp_path.exists():
-                LOGGER.warning("Missing BMP file for %s, skipping", json_path.name)
+        for bmp_path in _iter_bmp_files(image_dir):
+            stem = bmp_path.stem
+            json_path = annotation_dir / f"{stem}.json"
+            if not json_path.exists():
+                LOGGER.warning("Annotation not found for %s", bmp_path.name)
                 continue
 
-            image = Image.open(bmp_path).convert("RGB")
-            LOGGER.info("Processing %s (%dx%d)", json_path.name, image.width, image.height)
+            with Image.open(bmp_path) as image:
+                image = image.convert("RGB")
+                LOGGER.debug(
+                    "Split %s | %s (%dx%d)", split, bmp_path.name, image.width, image.height
+                )
 
-            for index, center, grade in _load_annotation(json_path):
-                crop = _crop_with_padding(image, center, 128)
-                crop_name = f"{stem}_{index:03d}.png"
-                crop.save(spot_dir / crop_name)
-                label_file.write(f"{stem}_{index:03d} {grade}\n")
+                annotation_iter = list(_load_annotation(json_path))
+                if not annotation_iter:
+                    LOGGER.warning("No valid annotations in %s", json_path.name)
+                for index, center, grade in annotation_iter:
+                    crop = _crop_with_padding(image, center, 128)
+                    crop_name = f"{stem}_{index:03d}.png"
+                    crop.save(spot_output_dir / crop_name)
+                    label_file.write(f"{stem}_{index:03d} {grade}\n")
+                    total_spots += 1
 
-            downsampled = _downsample_to_128(image)
-            downsampled.save(image_dir / f"{stem}.png")
+                downsampled = _downsample_to_128(image)
+                downsampled.save(image_output_dir / f"{stem}.png")
+                processed_images += 1
+
+    LOGGER.info(
+        "Finished split '%s': %d images, %d spot crops", split, processed_images, total_spots
+    )
+
+
+def process_dataset(yolo_root: Path, output_root: Path, overwrite_labels: bool = True) -> None:
+    annotation_dir = yolo_root
+    image_root = yolo_root / "laser" / "images"
+
+    for split in ("train", "val"):
+        split_image_dir = image_root / split
+        split_output_dir = output_root / split
+        process_split(
+            split=split,
+            image_dir=split_image_dir,
+            annotation_dir=annotation_dir,
+            output_dir=split_output_dir,
+            overwrite_labels=overwrite_labels,
+        )
+
+
+def _default_yolo_root() -> Path:
+    if DEFAULT_YOLO_ROOT.exists():
+        return DEFAULT_YOLO_ROOT
+    return Path("yolo_data")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare spot classification dataset")
-    parser.add_argument("--origin-dir", type=Path, default=Path("origin_data"), help="Directory containing JSON and BMP files")
-    parser.add_argument("--output-dir", type=Path, default=Path("data"), help="Output directory for processed dataset")
-    parser.add_argument("--keep-labels", action="store_true", help="Append to existing labels.txt instead of overwriting")
+    parser = argparse.ArgumentParser(description="Prepare train/val spot datasets from YOLO annotations")
+    parser.add_argument(
+        "--yolo-root",
+        type=Path,
+        default=_default_yolo_root(),
+        help="Root directory containing YOLO JSON files and laser/images/<split> folders",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("data"),
+        help="Destination directory where train/ and val/ folders will be created",
+    )
+    parser.add_argument(
+        "--keep-labels",
+        action="store_true",
+        help="Append to existing labels.txt instead of overwriting them",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level (default: INFO)")
     return parser.parse_args()
 
@@ -161,8 +222,11 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
     overwrite = not args.keep_labels
-    process_dataset(args.origin_dir, args.output_dir, overwrite_labels=overwrite)
-    LOGGER.info("Dataset preparation finished. Spot crops and labels are available in %s", args.output_dir)
+    process_dataset(args.yolo_root, args.output_root, overwrite_labels=overwrite)
+    LOGGER.info(
+        "Dataset preparation finished. Spot crops and labels are available in %s",
+        args.output_root,
+    )
 
 
 if __name__ == "__main__":
