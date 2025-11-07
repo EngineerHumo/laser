@@ -302,11 +302,11 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         with amp.autocast(enabled=config.amp):
-            embeddings, spot_features = model(spot, global_img)
+            embeddings, fusion_features = model(spot, global_img)
             arcface_logits = arcface(embeddings, labels)
             arcface_loss = ce_loss_fn(arcface_logits, labels)
 
-            classifier_logits = classifier(spot_features)
+            classifier_logits = classifier(fusion_features)
             classification_loss = ce_loss_fn(classifier_logits, labels)
 
             triplet_loss = batch_hard_triplet_loss(embeddings, labels, margin=config.triplet_margin)
@@ -408,10 +408,10 @@ def evaluate(
             global_img = batch["global"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
 
-            embeddings, spot_features = model(spot, global_img)
+            embeddings, fusion_features = model(spot, global_img)
             arcface_logits = arcface(embeddings, labels)
             arcface_loss = ce_loss_fn(arcface_logits, labels)
-            classifier_logits = classifier(spot_features)
+            classifier_logits = classifier(fusion_features)
             classification_loss = ce_loss_fn(classifier_logits, labels)
 
             triplet_loss = batch_hard_triplet_loss(embeddings, labels, margin=config.triplet_margin)
@@ -505,7 +505,7 @@ def run_training(config: TrainConfig) -> None:
 
     model = DualEncoderMetricModel().to(device)
     arcface = ArcMarginProduct(in_features=512, out_features=num_classes).to(device)
-    classifier = nn.Linear(256, num_classes).to(device)
+    classifier = nn.Linear(512, num_classes).to(device)
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(arcface.parameters()) + list(classifier.parameters()),

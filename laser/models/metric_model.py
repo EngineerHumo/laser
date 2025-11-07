@@ -48,6 +48,15 @@ class DualEncoderMetricModel(nn.Module):
         )
 
     def forward(self, spot: torch.Tensor, global_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the L2-normalised embedding together with the fused features.
+
+        The second tensor is the pre-normalisation representation that still
+        contains the fused spot/global information.  Downstream heads that
+        operate on classification logits should consume this tensor rather
+        than the 256-D spot-only features to ensure the decision surface uses
+        the same information as the metric losses.
+        """
+
         spot_feat = self.spot_encoder(spot)
         global_feat = self.global_encoder(global_img)
 
@@ -63,6 +72,6 @@ class DualEncoderMetricModel(nn.Module):
         context = torch.bmm(attn_weights.unsqueeze(1), values).squeeze(1)
 
         fusion_input = torch.cat([spot_feat, context], dim=-1)
-        embedding = self.fusion(fusion_input)
-        embedding = F.normalize(embedding, p=2, dim=-1)
-        return embedding, spot_feat
+        fusion_features = self.fusion(fusion_input)
+        embedding = F.normalize(fusion_features, p=2, dim=-1)
+        return embedding, fusion_features
