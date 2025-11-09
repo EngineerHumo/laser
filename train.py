@@ -8,7 +8,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import torch
@@ -25,7 +25,6 @@ from laser.datasets import (
     SpotSubsetDataset,
     build_global_transform,
     build_spot_transform,
-    create_stratified_folds,
 )
 from laser.models import DualEncoderMetricModel
 from laser.models.losses import ArcMarginProduct, batch_hard_triplet_loss
@@ -46,8 +45,8 @@ class TrainConfig:
     triplet_margin: float = 0.3
     triplet_weight: float = 1.0
     visdom_env: str = "spot_metric_learning"
+    visdom_port: int = 8100
     log_dir: Path = Path("logs")
-    fold_count: int = 5
     amp: bool = True
 
 
@@ -73,7 +72,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--triplet-weight", type=float, default=1.0)
     parser.add_argument("--visdom-env", type=str, default="spot_metric_learning")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"))
-    parser.add_argument("--fold-count", type=int, default=5)
+    parser.add_argument("--visdom-port", type=int, default=8100)
     parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     args = parser.parse_args()
 
@@ -88,8 +87,8 @@ def parse_args() -> TrainConfig:
         triplet_margin=args.triplet_margin,
         triplet_weight=args.triplet_weight,
         visdom_env=args.visdom_env,
+        visdom_port=args.visdom_port,
         log_dir=args.log_dir,
-        fold_count=args.fold_count,
         amp=not args.no_amp,
     )
 
@@ -112,9 +111,8 @@ def collate_fn(batch: Iterable[SpotSample]) -> Dict[str, torch.Tensor]:
 
 
 def create_dataloaders(
-    dataset: SpotDataset,
-    train_indices: List[int],
-    val_indices: List[int],
+    train_dataset: SpotDataset,
+    val_dataset: SpotDataset,
     config: TrainConfig,
 ) -> Tuple[DataLoader, DataLoader]:
     train_spot_transform = build_spot_transform(augment=True)
@@ -122,14 +120,14 @@ def create_dataloaders(
     global_transform = build_global_transform()
 
     train_subset = SpotSubsetDataset(
-        dataset,
-        train_indices,
+        train_dataset,
+        list(range(len(train_dataset))),
         spot_transform=train_spot_transform,
         global_transform=global_transform,
     )
     val_subset = SpotSubsetDataset(
-        dataset,
-        val_indices,
+        val_dataset,
+        list(range(len(val_dataset))),
         spot_transform=eval_spot_transform,
         global_transform=global_transform,
     )
@@ -330,109 +328,109 @@ def run_training(config: TrainConfig) -> None:
     set_seed()
     configure_logging(config.log_dir)
     device = torch.device(config.device)
-    dataset = SpotDataset(config.data_dir)
-    folds = create_stratified_folds(dataset.labels.tolist(), config.fold_count)
-    vis_logger = VisdomLogger(env=config.visdom_env)
+    train_root = config.data_dir / "train"
+    val_root = config.data_dir / "val"
 
-    fold_metrics: List[Dict[str, float]] = []
+    train_dataset = SpotDataset(train_root)
+    val_dataset = SpotDataset(val_root)
 
-    for fold_idx in range(config.fold_count):
-        val_indices = folds[fold_idx]
-        train_indices = [idx for i, fold in enumerate(folds) if i != fold_idx for idx in fold]
+    if len(train_dataset) == 0:
+        raise RuntimeError(f"No training samples found in {train_root}")
+    if len(val_dataset) == 0:
+        raise RuntimeError(f"No validation samples found in {val_root}")
 
-        if not val_indices:
-            LOGGER.warning("Fold %d has no validation samples; skipping", fold_idx + 1)
-            continue
-        if not train_indices:
-            LOGGER.warning("Fold %d has no training samples; skipping", fold_idx + 1)
-            continue
+    LOGGER.info(
+        "Loaded datasets | train: %d samples from %s | val: %d samples from %s",
+        len(train_dataset),
+        train_root,
+        len(val_dataset),
+        val_root,
+    )
 
-        LOGGER.info("Starting fold %d/%d (train=%d, val=%d)", fold_idx + 1, config.fold_count, len(train_indices), len(val_indices))
-        train_loader, val_loader = create_dataloaders(dataset, train_indices, val_indices, config)
+    vis_logger = VisdomLogger(env=config.visdom_env, port=config.visdom_port)
 
-        model = DualEncoderMetricModel().to(device)
-        arcface = ArcMarginProduct(in_features=512, out_features=dataset.num_classes).to(device)
+    train_loader, val_loader = create_dataloaders(train_dataset, val_dataset, config)
 
-        optimizer = torch.optim.AdamW(
-            list(model.parameters()) + list(arcface.parameters()),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
+    num_classes = max(train_dataset.num_classes, val_dataset.num_classes)
+    model = DualEncoderMetricModel().to(device)
+    arcface = ArcMarginProduct(in_features=512, out_features=num_classes).to(device)
+
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(arcface.parameters()),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs * len(train_loader))
+    scaler = amp.GradScaler(enabled=config.amp)
+
+    best_val_acc = float("-inf")
+    best_epoch = -1
+
+    for epoch in range(config.num_epochs):
+        train_loss, train_acc = train_one_epoch(
+            model, arcface, train_loader, optimizer, scheduler, device, scaler, config, epoch, vis_logger
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs * len(train_loader))
-        scaler = amp.GradScaler(enabled=config.amp)
+        val_metrics = evaluate(model, arcface, val_loader, device, config, epoch, vis_logger)
+        val_loss = val_metrics.loss
+        val_acc = val_metrics.accuracy
 
-        best_val_acc = 0.0
-        best_epoch = -1
+        LOGGER.info(
+            "Epoch %d/%d | train_loss=%.4f | train_acc=%.3f | val_loss=%.4f | val_acc=%.3f",
+            epoch + 1,
+            config.num_epochs,
+            train_loss,
+            train_acc,
+            val_loss,
+            val_acc,
+        )
 
-        for epoch in range(config.num_epochs):
-            train_loss, train_acc = train_one_epoch(
-                model, arcface, train_loader, optimizer, scheduler, device, scaler, config, epoch, vis_logger
+        per_class_log = ", ".join(
+            (
+                f"class {cls}: {acc:.3f} ({val_metrics.class_counts.get(cls, 0)} samples)"
+                if not math.isnan(acc)
+                else f"class {cls}: N/A ({val_metrics.class_counts.get(cls, 0)} samples)"
             )
-            val_metrics = evaluate(model, arcface, val_loader, device, config, epoch, vis_logger)
-            val_loss = val_metrics.loss
-            val_acc = val_metrics.accuracy
+            for cls, acc in sorted(val_metrics.per_class_accuracy.items())
+        )
+        LOGGER.info(
+            "Epoch %d | Validation per-class accuracy: %s",
+            epoch + 1,
+            per_class_log,
+        )
+        confusion_array = val_metrics.confusion_matrix.cpu().numpy()
+        confusion_rows = ["\t".join(f"{int(value):d}" for value in row) for row in confusion_array]
+        header = "\t".join(str(cls) for cls in range(confusion_array.shape[1]))
+        matrix_lines = ["Predicted", "\t" + header]
+        matrix_lines.extend(
+            f"{cls}\t" + row for cls, row in zip(range(confusion_array.shape[0]), confusion_rows)
+        )
+        matrix_text = "\n".join(matrix_lines)
+        LOGGER.info(
+            "Epoch %d | Confusion matrix (rows=gt, cols=pred):\n%s",
+            epoch + 1,
+            matrix_text,
+        )
 
-            LOGGER.info(
-                "Fold %d | Epoch %d/%d | train_loss=%.4f | train_acc=%.3f | val_loss=%.4f | val_acc=%.3f",
-                fold_idx + 1,
-                epoch + 1,
-                config.num_epochs,
-                train_loss,
-                train_acc,
-                val_loss,
-                val_acc,
-            )
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch
+            checkpoint_dir = config.log_dir
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model_state": model.state_dict(),
+                "arcface_state": arcface.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "config": config.__dict__,
+                "epoch": epoch,
+                "val_acc": val_acc,
+            }, checkpoint_dir / "best.pt")
 
-            per_class_log = ", ".join(
-                (
-                    f"class {cls}: {acc:.3f} ({val_metrics.class_counts.get(cls, 0)} samples)"
-                    if not math.isnan(acc)
-                    else f"class {cls}: N/A ({val_metrics.class_counts.get(cls, 0)} samples)"
-                )
-                for cls, acc in sorted(val_metrics.per_class_accuracy.items())
-            )
-            LOGGER.info(
-                "Fold %d | Epoch %d | Validation per-class accuracy: %s",
-                fold_idx + 1,
-                epoch + 1,
-                per_class_log,
-            )
-            confusion_array = val_metrics.confusion_matrix.cpu().numpy()
-            confusion_rows = ["\t".join(f"{int(value):d}" for value in row) for row in confusion_array]
-            header = "\t".join(str(cls) for cls in range(confusion_array.shape[1]))
-            matrix_lines = ["Predicted", "\t" + header]
-            matrix_lines.extend(
-                f"{cls}\t" + row for cls, row in zip(range(confusion_array.shape[0]), confusion_rows)
-            )
-            matrix_text = "\n".join(matrix_lines)
-            LOGGER.info(
-                "Fold %d | Epoch %d | Confusion matrix (rows=gt, cols=pred):\n%s",
-                fold_idx + 1,
-                epoch + 1,
-                matrix_text,
-            )
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_epoch = epoch
-                checkpoint_dir = config.log_dir / f"fold_{fold_idx + 1}"
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    "model_state": model.state_dict(),
-                    "arcface_state": arcface.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "config": config.__dict__,
-                    "epoch": epoch,
-                    "val_acc": val_acc,
-                }, checkpoint_dir / "best.pt")
-
-        LOGGER.info("Fold %d completed. Best val acc=%.3f at epoch %d", fold_idx + 1, best_val_acc, best_epoch + 1)
-        fold_metrics.append({"fold": fold_idx + 1, "val_acc": best_val_acc})
-
-    summary = "\n".join(f"Fold {m['fold']}: val_acc={m['val_acc']:.3f}" for m in fold_metrics)
-    overall = sum(m["val_acc"] for m in fold_metrics) / max(len(fold_metrics), 1)
-    LOGGER.info("Training finished.\n%s\nAverage accuracy: %.3f", summary, overall)
-    vis_logger.log_text("summary", f"Training finished\n{summary}\nAverage accuracy: {overall:.3f}")
+    LOGGER.info("Training finished. Best val acc=%.3f at epoch %d", best_val_acc, best_epoch + 1)
+    if best_epoch >= 0:
+        summary_text = f"Training finished<br>Best val acc: {best_val_acc:.3f} at epoch {best_epoch + 1}"
+    else:
+        summary_text = "Training finished<br>No validation epochs executed"
+    vis_logger.log_text("summary", summary_text)
 
 
 if __name__ == "main":
