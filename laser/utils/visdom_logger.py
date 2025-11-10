@@ -21,7 +21,7 @@ class VisdomLogger:
         self,
         env: str = "spot_metric_learning",
         server: str = "http://localhost",
-        port: int = 8100,
+        port: int = 8102,
         enabled: bool = True,
     ) -> None:
         self.enabled = enabled and Visdom is not None

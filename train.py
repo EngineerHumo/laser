@@ -45,7 +45,7 @@ class TrainConfig:
     triplet_margin: float = 0.3
     triplet_weight: float = 1.0
     visdom_env: str = "spot_metric_learning"
-    visdom_port: int = 8100
+    visdom_port: int = 8102
     log_dir: Path = Path("logs")
     amp: bool = True
 
@@ -72,7 +72,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--triplet-weight", type=float, default=1.0)
     parser.add_argument("--visdom-env", type=str, default="spot_metric_learning")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"))
-    parser.add_argument("--visdom-port", type=int, default=8100)
+    parser.add_argument("--visdom-port", type=int, default=8102)
     parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     args = parser.parse_args()
 
