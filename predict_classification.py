@@ -195,6 +195,28 @@ def legend_entries() -> Sequence[tuple[int, str]]:
     return [(cls, CLASS_GRADES.get(cls, str(cls))) for cls in sorted(CLASS_GRADES)]
 
 
+def measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:
+    """Return the width/height of *text* for the provided draw context."""
+
+    if hasattr(draw, "textbbox"):
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+        except ValueError:
+            pass
+        else:
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    if hasattr(draw, "textsize"):
+        width, height = draw.textsize(text, font=font)
+        return int(width), int(height)
+
+    if hasattr(font, "getsize"):
+        width, height = font.getsize(text)  # type: ignore[attr-defined]
+        return int(width), int(height)
+
+    raise RuntimeError("Unable to measure text size with the provided font")
+
+
 def draw_boxes(
     image: Image.Image,
     detections: Sequence[Detection],
@@ -221,9 +243,7 @@ def draw_boxes(
 
         label = CLASS_GRADES.get(pred, str(pred))
         text = f"{label}"
-        text_bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
+        text_width, text_height = measure_text(draw, text, font)
         text_top = max(top - text_height - 4, 0)
         text_bottom = min(text_top + text_height + 4, height)
         text_bg = [left, text_top, left + text_width + 6, text_bottom]
@@ -246,9 +266,9 @@ def draw_legend(draw: ImageDraw.ImageDraw, image_size: tuple[int, int], font: Im
     text_widths = []
     text_heights = []
     for _, label in entries:
-        bbox = draw.textbbox((0, 0), label, font=font)
-        text_widths.append(bbox[2] - bbox[0])
-        text_heights.append(bbox[3] - bbox[1])
+        width, height = measure_text(draw, label, font)
+        text_widths.append(width)
+        text_heights.append(height)
 
     max_text_width = max(text_widths)
     line_height = max(max(text_heights), swatch_size)
