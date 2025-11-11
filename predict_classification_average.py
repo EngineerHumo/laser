@@ -398,6 +398,83 @@ def _remove_outlier_and_average(count_series: Sequence[Sequence[int]]) -> list[i
     return averaged
 
 
+def _average_distribution_from_counts(count_series: Sequence[Sequence[int]]) -> list[float]:
+    if not count_series:
+        return []
+
+    num_classes = len(count_series[0])
+    sums = [0.0] * num_classes
+    for counts in count_series:
+        distribution = _counts_to_distribution(counts)
+        for class_idx in range(num_classes):
+            sums[class_idx] += distribution[class_idx]
+
+    total_series = float(len(count_series))
+    if total_series <= 0:
+        return [0.0] * num_classes
+
+    return [value / total_series for value in sums]
+
+
+def _drop_farthest_from_reference(
+    count_series: Sequence[Sequence[int]],
+    reference_distribution: Sequence[float],
+    num_drop: int,
+) -> list[list[int]]:
+    if not count_series or not reference_distribution or num_drop <= 0:
+        return [list(counts) for counts in count_series]
+
+    usable_drop = min(num_drop, len(count_series))
+    num_classes = min(len(count_series[0]), len(reference_distribution))
+
+    distances = []
+    for counts in count_series:
+        distribution = _counts_to_distribution(counts)
+        distance = sum(
+            abs(distribution[class_idx] - reference_distribution[class_idx])
+            for class_idx in range(num_classes)
+        )
+        distances.append(distance)
+
+    indices = np.argsort(distances)[::-1][:usable_drop]
+    drop_set = {int(idx) for idx in indices}
+    return [list(count_series[idx]) for idx in range(len(count_series)) if idx not in drop_set]
+
+
+def _drop_most_anomalous_frame(count_series: Sequence[Sequence[int]]) -> list[list[int]]:
+    if not count_series:
+        return []
+    if len(count_series) <= 1:
+        return [list(count_series[0])]
+
+    num_classes = len(count_series[0])
+    distributions = [_counts_to_distribution(counts) for counts in count_series]
+    mean_distribution = [
+        sum(dist[class_idx] for dist in distributions) / len(distributions)
+        for class_idx in range(num_classes)
+    ]
+
+    distances = [
+        sum(abs(dist[class_idx] - mean_distribution[class_idx]) for class_idx in range(num_classes))
+        for dist in distributions
+    ]
+    outlier_index = int(np.argmax(distances))
+
+    return [list(count_series[idx]) for idx in range(len(count_series)) if idx != outlier_index]
+
+
+def _average_counts(count_series: Sequence[Sequence[int]]) -> list[int]:
+    if not count_series:
+        return []
+
+    num_classes = len(count_series[0])
+    averaged = []
+    for class_idx in range(num_classes):
+        mean_count = sum(counts[class_idx] for counts in count_series) / len(count_series)
+        averaged.append(max(0, int(round(mean_count))))
+    return averaged
+
+
 def _find_uncovered_zero(matrix: np.ndarray, row_cover: np.ndarray, col_cover: np.ndarray) -> tuple[int, int]:
     eps = 1e-9
     for i in range(matrix.shape[0]):
@@ -599,6 +676,9 @@ def run_inference() -> None:
 
     reference_counts: list[int] | None = None
     reference_history: list[list[int]] = []
+    all_txt_counts: list[list[int]] = []
+    first_hundred_distribution: list[float] | None = None
+    processed_frames = 0
 
     with torch.no_grad():
         for frame_index, image_path in enumerate(image_paths):
@@ -642,6 +722,14 @@ def run_inference() -> None:
 
                 txt_classes = [det.class_id for det in detections]
                 txt_counts = _counts_from_classes(txt_classes, num_classes)
+                all_txt_counts.append(txt_counts.copy())
+
+                if first_hundred_distribution is None and len(all_txt_counts) >= 100:
+                    first_hundred_distribution = _average_distribution_from_counts(
+                        all_txt_counts[:100]
+                    )
+
+                current_frame_number = processed_frames + 1
 
                 if reference_counts is None:
                     if any(txt_counts):
@@ -653,14 +741,36 @@ def run_inference() -> None:
                         )
                         reference_counts = _counts_from_classes(fallback_classes, num_classes)
                     standard_counts = reference_counts.copy()
-                elif frame_index < 5:
+                elif current_frame_number <= 5:
                     standard_counts = reference_counts.copy()
-                else:
+                elif current_frame_number <= 100:
                     window = reference_history[-5:] + [txt_counts]
                     if len(window) < 6 or not any(txt_counts):
                         standard_counts = reference_counts.copy()
                     else:
                         standard_counts = _remove_outlier_and_average(window)
+                else:
+                    if first_hundred_distribution is None:
+                        standard_counts = reference_counts.copy()
+                    else:
+                        window_counts = all_txt_counts[-10:]
+                        if len(window_counts) < 10:
+                            standard_counts = reference_counts.copy()
+                        else:
+                            filtered = _drop_farthest_from_reference(
+                                window_counts, first_hundred_distribution, 4
+                            )
+                            if len(filtered) < 6:
+                                filtered = window_counts
+                            trimmed = _drop_most_anomalous_frame(filtered)
+                            if len(trimmed) > 5:
+                                trimmed = trimmed[-5:]
+                            if len(trimmed) < 5:
+                                trimmed = filtered[-5:]
+                            if not trimmed:
+                                standard_counts = reference_counts.copy()
+                            else:
+                                standard_counts = _average_counts(trimmed)
 
                 if len(standard_counts) != num_classes:
                     adjusted_counts = [0] * num_classes
@@ -672,9 +782,11 @@ def run_inference() -> None:
                 final_predictions = _apply_matching(
                     similarity_matrix, standard_counts, fallback_classes
                 )
-                reference_history.append(txt_counts)
+                reference_history.append(txt_counts.copy())
                 if len(reference_history) > 5:
                     reference_history = reference_history[-5:]
+
+                processed_frames = current_frame_number
 
                 # Write updated detections with predicted class ids.
                 output_txt_path = output_dir / txt_path.name
