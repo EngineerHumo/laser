@@ -134,20 +134,71 @@ def read_detections(txt_path: Path) -> List[Detection]:
     detections: List[Detection] = []
     with txt_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            parts = line.strip().split()
-            if len(parts) < 5:
-                LOGGER.warning("Skipping malformed line %d in %s", line_number, txt_path)
+            stripped = line.strip()
+            if not stripped:
                 continue
+
+            tokens = stripped.split()
+            key_values: dict[str, str] = {}
+            ordered_tokens: list[str] = []
+            for token in tokens:
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    key_values[key.strip().lower()] = value.strip()
+                else:
+                    ordered_tokens.append(token)
+
+            class_token = key_values.pop("class", None)
+            if class_token is None:
+                if not ordered_tokens:
+                    LOGGER.warning("Missing class information on line %d in %s", line_number, txt_path)
+                    continue
+                class_token = ordered_tokens[0]
+                ordered_tokens = ordered_tokens[1:]
+
             try:
-                class_id = int(float(parts[0]))
-                x_center = float(parts[1])
-                y_center = float(parts[2])
-                width = float(parts[3])
-                height = float(parts[4])
+                class_id = int(float(class_token))
             except ValueError:
-                LOGGER.warning("Non-numeric values on line %d in %s", line_number, txt_path)
+                LOGGER.warning("Invalid class value '%s' on line %d in %s", class_token, line_number, txt_path)
                 continue
-            detections.append(Detection(class_id, x_center, y_center, width, height))
+
+            sequential_iter = iter(ordered_tokens)
+
+            def take_next_float() -> float | None:
+                for token in sequential_iter:
+                    try:
+                        return float(token)
+                    except ValueError:
+                        continue
+                return None
+
+            def extract_float(*keys: str) -> float | None:
+                for key in keys:
+                    if key in key_values:
+                        try:
+                            return float(key_values.pop(key))
+                        except ValueError:
+                            LOGGER.warning(
+                                "Invalid numeric value for %s on line %d in %s",
+                                key,
+                                line_number,
+                                txt_path,
+                            )
+                            return None
+                return take_next_float()
+
+            x_center = extract_float("x_center", "center_x", "xc", "x")
+            y_center = extract_float("y_center", "center_y", "yc", "y")
+            width = extract_float("width", "w")
+            height = extract_float("height", "h")
+
+            if None in (x_center, y_center, width, height):
+                LOGGER.warning("Incomplete detection on line %d in %s", line_number, txt_path)
+                continue
+
+            detections.append(
+                Detection(class_id, float(x_center), float(y_center), float(width), float(height))
+            )
     return detections
 
 
@@ -547,7 +598,7 @@ def run_inference() -> None:
         return
 
     reference_counts: list[int] | None = None
-    argmax_history: list[list[int]] = []
+    reference_history: list[list[int]] = []
 
     with torch.no_grad():
         for frame_index, image_path in enumerate(image_paths):
@@ -588,16 +639,25 @@ def run_inference() -> None:
                 similarity_matrix = logits.detach().cpu().numpy()
                 fallback_classes = predicted.cpu().tolist()
                 num_classes = similarity_matrix.shape[1]
-                argmax_counts = _counts_from_classes(fallback_classes, num_classes)
+
+                txt_classes = [det.class_id for det in detections]
+                txt_counts = _counts_from_classes(txt_classes, num_classes)
 
                 if reference_counts is None:
-                    reference_counts = argmax_counts.copy()
+                    if any(txt_counts):
+                        reference_counts = txt_counts.copy()
+                    else:
+                        LOGGER.warning(
+                            "No valid class annotations found for %s; falling back to predictions",
+                            txt_path.name,
+                        )
+                        reference_counts = _counts_from_classes(fallback_classes, num_classes)
                     standard_counts = reference_counts.copy()
                 elif frame_index < 5:
                     standard_counts = reference_counts.copy()
                 else:
-                    window = argmax_history[-5:] + [argmax_counts]
-                    if len(window) < 6:
+                    window = reference_history[-5:] + [txt_counts]
+                    if len(window) < 6 or not any(txt_counts):
                         standard_counts = reference_counts.copy()
                     else:
                         standard_counts = _remove_outlier_and_average(window)
@@ -612,9 +672,9 @@ def run_inference() -> None:
                 final_predictions = _apply_matching(
                     similarity_matrix, standard_counts, fallback_classes
                 )
-                argmax_history.append(argmax_counts)
-                if len(argmax_history) > 5:
-                    argmax_history = argmax_history[-5:]
+                reference_history.append(txt_counts)
+                if len(reference_history) > 5:
+                    reference_history = reference_history[-5:]
 
                 # Write updated detections with predicted class ids.
                 output_txt_path = output_dir / txt_path.name
