@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("/home/wensheng/jiaqi/laser/logs/fold_1/best.pt"),
+        default=Path("/home/wensheng/jiaqi/laser/logs/best.pt"),
         help="Path to the trained model checkpoint",
     )
     parser.add_argument(
