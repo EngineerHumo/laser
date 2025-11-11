@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
+import numpy as np
+
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
@@ -302,6 +304,226 @@ def draw_legend(draw: ImageDraw.ImageDraw, image_size: tuple[int, int], font: Im
         y += line_height + spacing
 
 
+def _counts_from_classes(classes: Sequence[int], num_classes: int) -> list[int]:
+    counts = [0] * num_classes
+    for cls in classes:
+        if 0 <= cls < num_classes:
+            counts[cls] += 1
+    return counts
+
+
+def _counts_to_distribution(counts: Sequence[int]) -> list[float]:
+    total = float(sum(counts))
+    if total <= 0:
+        return [0.0 for _ in counts]
+    return [c / total for c in counts]
+
+
+def _remove_outlier_and_average(count_series: Sequence[Sequence[int]]) -> list[int]:
+    if not count_series:
+        return []
+
+    num_classes = len(count_series[0])
+    distributions = [_counts_to_distribution(counts) for counts in count_series]
+    mean_distribution = [
+        sum(dist[class_idx] for dist in distributions) / len(distributions)
+        for class_idx in range(num_classes)
+    ]
+
+    distances = [
+        sum(abs(dist[class_idx] - mean_distribution[class_idx]) for class_idx in range(num_classes))
+        for dist in distributions
+    ]
+    outlier_index = int(np.argmax(distances))
+
+    retained = [counts for idx, counts in enumerate(count_series) if idx != outlier_index]
+    if not retained:
+        retained = [count_series[outlier_index]]
+
+    averaged = []
+    for class_idx in range(num_classes):
+        mean_count = sum(counts[class_idx] for counts in retained) / len(retained)
+        averaged.append(max(0, int(round(mean_count))))
+    return averaged
+
+
+def _find_uncovered_zero(matrix: np.ndarray, row_cover: np.ndarray, col_cover: np.ndarray) -> tuple[int, int]:
+    eps = 1e-9
+    for i in range(matrix.shape[0]):
+        if row_cover[i]:
+            continue
+        for j in range(matrix.shape[1]):
+            if col_cover[j]:
+                continue
+            if abs(matrix[i, j]) <= eps:
+                return i, j
+    return -1, -1
+
+
+def _find_star_in_row(star_matrix: np.ndarray, row: int) -> int | None:
+    cols = np.where(star_matrix[row])[0]
+    if cols.size == 0:
+        return None
+    return int(cols[0])
+
+
+def _find_star_in_col(star_matrix: np.ndarray, col: int) -> int | None:
+    rows = np.where(star_matrix[:, col])[0]
+    if rows.size == 0:
+        return None
+    return int(rows[0])
+
+
+def _find_prime_in_row(prime_matrix: np.ndarray, row: int) -> int | None:
+    cols = np.where(prime_matrix[row])[0]
+    if cols.size == 0:
+        return None
+    return int(cols[0])
+
+
+def _hungarian_square(cost_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    matrix = cost_matrix.copy()
+    n = matrix.shape[0]
+
+    matrix -= matrix.min(axis=1, keepdims=True)
+    matrix -= matrix.min(axis=0, keepdims=True)
+
+    star_matrix = np.zeros_like(matrix, dtype=bool)
+    prime_matrix = np.zeros_like(matrix, dtype=bool)
+    row_cover = np.zeros(n, dtype=bool)
+    col_cover = np.zeros(n, dtype=bool)
+
+    eps = 1e-9
+    for i in range(n):
+        for j in range(n):
+            if row_cover[i] or col_cover[j]:
+                continue
+            if abs(matrix[i, j]) <= eps:
+                star_matrix[i, j] = True
+                row_cover[i] = True
+                col_cover[j] = True
+                break
+    row_cover[:] = False
+    col_cover[:] = False
+
+    step = 3
+    path: list[tuple[int, int]] = []
+
+    while True:
+        if step == 3:
+            col_cover[:] = np.any(star_matrix, axis=0)
+            if int(col_cover.sum()) == n:
+                break
+            step = 4
+        elif step == 4:
+            row, col = _find_uncovered_zero(matrix, row_cover, col_cover)
+            if row == -1:
+                step = 6
+            else:
+                prime_matrix[row, col] = True
+                star_col = _find_star_in_row(star_matrix, row)
+                if star_col is not None:
+                    row_cover[row] = True
+                    col_cover[star_col] = False
+                else:
+                    path = [(row, col)]
+                    step = 5
+        elif step == 5:
+            done = False
+            while not done:
+                row, col = path[-1]
+                star_row = _find_star_in_col(star_matrix, col)
+                if star_row is None:
+                    done = True
+                    continue
+                path.append((star_row, col))
+                prime_col = _find_prime_in_row(prime_matrix, star_row)
+                if prime_col is None:
+                    done = True
+                    continue
+                path.append((star_row, prime_col))
+
+            for r, c in path:
+                if star_matrix[r, c]:
+                    star_matrix[r, c] = False
+                else:
+                    star_matrix[r, c] = True
+
+            prime_matrix[:, :] = False
+            row_cover[:] = False
+            col_cover[:] = False
+            step = 3
+        elif step == 6:
+            uncovered_rows = ~row_cover
+            uncovered_cols = ~col_cover
+            if not np.any(uncovered_rows) or not np.any(uncovered_cols):
+                step = 3
+                continue
+            uncovered_values = matrix[np.ix_(uncovered_rows, uncovered_cols)]
+            min_uncovered = float(np.min(uncovered_values))
+            matrix[row_cover, :] += min_uncovered
+            matrix[:, ~col_cover] -= min_uncovered
+            step = 4
+        else:
+            break
+
+    row_indices, col_indices = np.where(star_matrix)
+    return row_indices, col_indices
+
+
+def _solve_linear_assignment(cost_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if cost_matrix.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    num_rows, num_cols = cost_matrix.shape
+    size = max(num_rows, num_cols)
+    max_cost = float(np.max(cost_matrix)) if cost_matrix.size else 0.0
+    padding_value = max_cost + abs(max_cost) + 1.0
+
+    padded = np.full((size, size), padding_value, dtype=float)
+    padded[:num_rows, :num_cols] = cost_matrix
+
+    row_ind, col_ind = _hungarian_square(padded)
+    valid = (row_ind < num_rows) & (col_ind < num_cols)
+    return row_ind[valid], col_ind[valid]
+
+
+def _apply_matching(
+    similarity_matrix: np.ndarray,
+    standard_counts: Sequence[int],
+    fallback_classes: Sequence[int],
+) -> list[int]:
+    num_detections = similarity_matrix.shape[0]
+    num_classes = similarity_matrix.shape[1] if similarity_matrix.ndim == 2 else 0
+
+    target_labels: list[int] = []
+    for class_idx, count in enumerate(standard_counts):
+        if count <= 0:
+            continue
+        target_labels.extend([class_idx] * int(count))
+
+    if not target_labels:
+        return list(fallback_classes)
+
+    selected = similarity_matrix[:, target_labels]
+    cost_matrix = -selected
+    row_ind, col_ind = _solve_linear_assignment(cost_matrix)
+
+    assignments: list[int | None] = [None] * num_detections
+    for row, col in zip(row_ind.tolist(), col_ind.tolist()):
+        if 0 <= row < num_detections:
+            assignments[row] = target_labels[col]
+
+    final_classes: list[int] = []
+    for idx in range(num_detections):
+        assigned = assignments[idx]
+        if assigned is None or not (0 <= assigned < num_classes):
+            final_classes.append(int(fallback_classes[idx]))
+        else:
+            final_classes.append(int(assigned))
+    return final_classes
+
+
 def run_inference() -> None:
     args = parse_args()
     configure_logging()
@@ -324,8 +546,11 @@ def run_inference() -> None:
         LOGGER.warning("No images found in %s", input_dir)
         return
 
+    reference_counts: list[int] | None = None
+    argmax_history: list[list[int]] = []
+
     with torch.no_grad():
-        for image_path in image_paths:
+        for frame_index, image_path in enumerate(image_paths):
             txt_path = image_path.with_suffix(".txt")
             if not txt_path.exists():
                 LOGGER.warning("Missing detection file for %s", image_path.name)
@@ -360,22 +585,51 @@ def run_inference() -> None:
                 logits = arcface.inference(embeddings)
                 predicted = torch.argmax(logits, dim=1)
 
-                predictions = predicted.cpu().tolist()
+                similarity_matrix = logits.detach().cpu().numpy()
+                fallback_classes = predicted.cpu().tolist()
+                num_classes = similarity_matrix.shape[1]
+                argmax_counts = _counts_from_classes(fallback_classes, num_classes)
+
+                if reference_counts is None:
+                    reference_counts = argmax_counts.copy()
+                    standard_counts = reference_counts.copy()
+                elif frame_index < 5:
+                    standard_counts = reference_counts.copy()
+                else:
+                    window = argmax_history[-5:] + [argmax_counts]
+                    if len(window) < 6:
+                        standard_counts = reference_counts.copy()
+                    else:
+                        standard_counts = _remove_outlier_and_average(window)
+
+                if len(standard_counts) != num_classes:
+                    adjusted_counts = [0] * num_classes
+                    usable = min(len(standard_counts), num_classes)
+                    for idx in range(usable):
+                        adjusted_counts[idx] = max(0, int(standard_counts[idx]))
+                    standard_counts = adjusted_counts
+
+                final_predictions = _apply_matching(
+                    similarity_matrix, standard_counts, fallback_classes
+                )
+                argmax_history.append(argmax_counts)
+                if len(argmax_history) > 5:
+                    argmax_history = argmax_history[-5:]
 
                 # Write updated detections with predicted class ids.
                 output_txt_path = output_dir / txt_path.name
                 with output_txt_path.open("w", encoding="utf-8") as handle:
-                    for det, pred in zip(detections, predictions):
+                    for det, pred in zip(detections, final_predictions):
                         handle.write(
                             f"{pred} {det.x_center:.6f} {det.y_center:.6f} {det.width:.6f} {det.height:.6f}\n"
                         )
 
-                annotated = draw_boxes(img, detections, predictions)
+                annotated = draw_boxes(img, detections, final_predictions)
                 output_image_path = output_dir / image_path.name
                 annotated.save(output_image_path)
 
                 grade_counts = {}
-                for pred in predictions:
+                for pred in final_predictions:
                     grade_counts[pred] = grade_counts.get(pred, 0) + 1
                 counts_str = ", ".join(
                     f"{CLASS_GRADES.get(cls, cls)}: {count}" for cls, count in sorted(grade_counts.items())
