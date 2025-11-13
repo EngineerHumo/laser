@@ -58,6 +58,10 @@ CLASS_COLORS = {
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+CROP_BOTTOM_PIXELS = 38
+TARGET_IMAGE_SIZE = (1240, 1240)
+
+
 @dataclass
 class Detection:
     """Container describing a YOLO-format detection."""
@@ -278,6 +282,34 @@ def iter_image_files(directory: Path) -> Iterable[Path]:
     for path in sorted(directory.iterdir()):
         if path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS and path.is_file():
             yield path
+
+
+def load_input_image(image_path: Path) -> Image.Image:
+    with Image.open(image_path) as raw_img:
+        img = raw_img.convert("RGB")
+
+    width, height = img.size
+    if height > CROP_BOTTOM_PIXELS:
+        trimmed_height = height - CROP_BOTTOM_PIXELS
+        img = img.crop((0, 0, width, trimmed_height))
+        width, height = img.size
+    else:
+        LOGGER.warning(
+            "Image %s height %s too small to trim %s pixels",  # type: ignore[str-format]
+            image_path.name,
+            height,
+            CROP_BOTTOM_PIXELS,
+        )
+
+    if (width, height) != TARGET_IMAGE_SIZE:
+        LOGGER.warning(
+            "Image %s has unexpected size %s after trimming; expected %s",  # type: ignore[str-format]
+            image_path.name,
+            (width, height),
+            TARGET_IMAGE_SIZE,
+        )
+
+    return img
 
 
 def legend_entries() -> Sequence[tuple[int, str]]:
@@ -764,38 +796,84 @@ def run_inference() -> None:
                 LOGGER.info("No detections found for %s", image_path.name)
                 # Still copy the original image for completeness.
                 output_image_path = output_dir / image_path.name
-                with Image.open(image_path) as img:
-                    img.convert("RGB").save(output_image_path)
+                img = load_input_image(image_path)
+                img.save(output_image_path)
                 continue
 
-            with Image.open(image_path) as img:
-                img = img.convert("RGB")
-                width, height = img.size
+            img = load_input_image(image_path)
+            width, height = img.size
 
-                spots = []
-                for det in detections:
-                    center_x = det.x_center * width
-                    center_y = det.y_center * height
-                    spot_patch = crop_spot(img, center_x, center_y)
-                    spot_tensor = prepare_spot_tensor(spot_patch, normalise)
-                    spots.append(spot_tensor)
+            spots = []
+            for det in detections:
+                center_x = det.x_center * width
+                center_y = det.y_center * height
+                spot_patch = crop_spot(img, center_x, center_y)
+                spot_tensor = prepare_spot_tensor(spot_patch, normalise)
+                spots.append(spot_tensor)
 
-                spot_batch = torch.stack(spots, dim=0).to(device)
-                global_tensor = prepare_global_tensor(img, normalise)
-                global_batch = global_tensor.unsqueeze(0).repeat(len(detections), 1, 1, 1).to(device)
+            spot_batch = torch.stack(spots, dim=0).to(device)
+            global_tensor = prepare_global_tensor(img, normalise)
+            global_batch = global_tensor.unsqueeze(0).repeat(len(detections), 1, 1, 1).to(device)
 
-                embeddings, _ = model(spot_batch, global_batch)
-                logits = arcface.inference(embeddings)
-                predicted = torch.argmax(logits, dim=1)
+            embeddings, _ = model(spot_batch, global_batch)
+            logits = arcface.inference(embeddings)
+            predicted = torch.argmax(logits, dim=1)
 
-                similarity_matrix = logits.detach().cpu().numpy()
-                fallback_classes = predicted.cpu().tolist()
-                num_classes = similarity_matrix.shape[1]
+            similarity_matrix = logits.detach().cpu().numpy()
+            fallback_classes = predicted.cpu().tolist()
+            num_classes = similarity_matrix.shape[1]
 
-                txt_classes = [det.class_id for det in detections]
-                txt_counts = _counts_from_classes(txt_classes, num_classes)
+            txt_classes = [det.class_id for det in detections]
+            txt_counts = _counts_from_classes(txt_classes, num_classes)
 
-                current_frame_number = processed_frames + 1
+            current_frame_number = processed_frames + 1
+
+            frame_tensor = TF.to_tensor(img)
+            hsv_image = img.convert("HSV")
+            v_channel = np.asarray(hsv_image, dtype=np.float32)[..., 2] / 255.0
+
+            if first_hundred_v_sum is None and current_frame_number <= 100:
+                first_hundred_v_sum = np.zeros_like(v_channel, dtype=np.float64)
+                base_v_shape = v_channel.shape
+
+            if current_frame_number <= 100 and first_hundred_v_sum is not None:
+                if base_v_shape is not None and v_channel.shape != base_v_shape:
+                    LOGGER.warning(
+                        "Frame %s shape mismatch for V channel averaging; expected %s, got %s",
+                        image_path.name,
+                        base_v_shape,
+                        v_channel.shape,
+                    )
+                else:
+                    first_hundred_v_sum += v_channel.astype(np.float64)
+                    first_hundred_v_count += 1
+                    if current_frame_number == 100:
+                        divisor = max(first_hundred_v_count, 1)
+                        first_hundred_v_mean = (
+                            first_hundred_v_sum / float(divisor)
+                        ).astype(np.float32)
+
+            if (
+                current_frame_number > 100
+                and first_hundred_v_mean is None
+                and first_hundred_v_sum is not None
+                and first_hundred_v_count > 0
+            ):
+                first_hundred_v_mean = (
+                    first_hundred_v_sum / float(first_hundred_v_count)
+                ).astype(np.float32)
+
+                frame_stats = FrameStatistics(
+                    index=current_frame_number,
+                    txt_counts=txt_counts.copy(),
+                    v_channel=v_channel.astype(np.float32),
+                    image_tensor=frame_tensor,
+                    image_name=image_path.name,
+                )
+                recent_frames.append(frame_stats)
+
+                dropped_v_frames: list[FrameStatistics] = []
+                dropped_distribution_frame: Optional[FrameStatistics] = None
 
                 frame_tensor = TF.to_tensor(img)
                 hsv_image = img.convert("HSV")
