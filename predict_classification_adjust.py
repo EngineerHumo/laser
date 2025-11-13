@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -26,6 +27,7 @@ from torchvision.transforms import functional as TF
 from laser.datasets import SPOT_MEAN, SPOT_STD
 from laser.models import DualEncoderMetricModel
 from laser.models.losses import ArcMarginProduct
+from laser.utils import VisdomLogger
 
 
 LOGGER = logging.getLogger("predict_classification")
@@ -56,6 +58,10 @@ CLASS_COLORS = {
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+CROP_BOTTOM_PIXELS = 38
+TARGET_IMAGE_SIZE = (1240, 1240)
+
+
 @dataclass
 class Detection:
     """Container describing a YOLO-format detection."""
@@ -65,6 +71,17 @@ class Detection:
     y_center: float
     width: float
     height: float
+
+
+@dataclass
+class FrameStatistics:
+    """Summary information required for sliding window analysis."""
+
+    index: int
+    txt_counts: list[int]
+    v_channel: np.ndarray
+    image_tensor: torch.Tensor
+    image_name: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +109,29 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Computation device (e.g. 'cuda:0' or 'cpu'). Defaults to CUDA when available.",
+    )
+    parser.add_argument(
+        "--visdom-env",
+        type=str,
+        default="spot_metric_learning",
+        help="Visdom environment name for visualisation.",
+    )
+    parser.add_argument(
+        "--visdom-port",
+        type=int,
+        default=8102,
+        help="Visdom server port.",
+    )
+    parser.add_argument(
+        "--visdom-server",
+        type=str,
+        default="http://localhost",
+        help="Visdom server address.",
+    )
+    parser.add_argument(
+        "--disable-visdom",
+        action="store_true",
+        help="Disable Visdom visualisations.",
     )
     return parser.parse_args()
 
@@ -244,6 +284,34 @@ def iter_image_files(directory: Path) -> Iterable[Path]:
             yield path
 
 
+def load_input_image(image_path: Path) -> Image.Image:
+    with Image.open(image_path) as raw_img:
+        img = raw_img.convert("RGB")
+
+    width, height = img.size
+    if height > CROP_BOTTOM_PIXELS:
+        trimmed_height = height - CROP_BOTTOM_PIXELS
+        img = img.crop((0, 0, width, trimmed_height))
+        width, height = img.size
+    else:
+        LOGGER.warning(
+            "Image %s height %s too small to trim %s pixels",  # type: ignore[str-format]
+            image_path.name,
+            height,
+            CROP_BOTTOM_PIXELS,
+        )
+
+    if (width, height) != TARGET_IMAGE_SIZE:
+        LOGGER.warning(
+            "Image %s has unexpected size %s after trimming; expected %s",  # type: ignore[str-format]
+            image_path.name,
+            (width, height),
+            TARGET_IMAGE_SIZE,
+        )
+
+    return img
+
+
 def legend_entries() -> Sequence[tuple[int, str]]:
     return [(cls, CLASS_GRADES.get(cls, str(cls))) for cls in sorted(CLASS_GRADES)]
 
@@ -368,6 +436,31 @@ def _counts_to_distribution(counts: Sequence[int]) -> list[float]:
     if total <= 0:
         return [0.0 for _ in counts]
     return [c / total for c in counts]
+
+
+def _stack_for_visdom(tensors: Sequence[torch.Tensor]) -> Optional[torch.Tensor]:
+    if not tensors:
+        return None
+
+    target_hw = tensors[0].shape[-2:]
+    processed: list[torch.Tensor] = []
+    for tensor in tensors:
+        if tensor.ndim != 3:
+            continue
+        candidate = tensor
+        if tensor.shape[-2:] != target_hw:
+            candidate = F.interpolate(
+                tensor.unsqueeze(0),
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        processed.append(candidate)
+
+    if not processed:
+        return None
+
+    return torch.stack(processed, dim=0)
 
 
 def _remove_outlier_and_average(count_series: Sequence[Sequence[int]]) -> list[int]:
@@ -674,11 +767,22 @@ def run_inference() -> None:
         LOGGER.warning("No images found in %s", input_dir)
         return
 
+    vis_logger = VisdomLogger(
+        env=args.visdom_env,
+        port=args.visdom_port,
+        server=args.visdom_server,
+        enabled=not args.disable_visdom,
+    )
+
     reference_counts: list[int] | None = None
     reference_history: list[list[int]] = []
-    all_txt_counts: list[list[int]] = []
-    first_hundred_distribution: list[float] | None = None
     processed_frames = 0
+
+    recent_frames: deque[FrameStatistics] = deque(maxlen=10)
+    first_hundred_v_sum: np.ndarray | None = None
+    first_hundred_v_count = 0
+    first_hundred_v_mean: np.ndarray | None = None
+    base_v_shape: tuple[int, int] | None = None
 
     with torch.no_grad():
         for frame_index, image_path in enumerate(image_paths):
@@ -692,44 +796,84 @@ def run_inference() -> None:
                 LOGGER.info("No detections found for %s", image_path.name)
                 # Still copy the original image for completeness.
                 output_image_path = output_dir / image_path.name
-                with Image.open(image_path) as img:
-                    img.convert("RGB").save(output_image_path)
+                img = load_input_image(image_path)
+                img.save(output_image_path)
                 continue
 
-            with Image.open(image_path) as img:
-                img = img.convert("RGB")
-                width, height = img.size
+            img = load_input_image(image_path)
+            width, height = img.size
 
-                spots = []
-                for det in detections:
-                    center_x = det.x_center * width
-                    center_y = det.y_center * height
-                    spot_patch = crop_spot(img, center_x, center_y)
-                    spot_tensor = prepare_spot_tensor(spot_patch, normalise)
-                    spots.append(spot_tensor)
+            spots = []
+            for det in detections:
+                center_x = det.x_center * width
+                center_y = det.y_center * height
+                spot_patch = crop_spot(img, center_x, center_y)
+                spot_tensor = prepare_spot_tensor(spot_patch, normalise)
+                spots.append(spot_tensor)
 
-                spot_batch = torch.stack(spots, dim=0).to(device)
-                global_tensor = prepare_global_tensor(img, normalise)
-                global_batch = global_tensor.unsqueeze(0).repeat(len(detections), 1, 1, 1).to(device)
+            spot_batch = torch.stack(spots, dim=0).to(device)
+            global_tensor = prepare_global_tensor(img, normalise)
+            global_batch = global_tensor.unsqueeze(0).repeat(len(detections), 1, 1, 1).to(device)
 
-                embeddings, _ = model(spot_batch, global_batch)
-                logits = arcface.inference(embeddings)
-                predicted = torch.argmax(logits, dim=1)
+            embeddings, _ = model(spot_batch, global_batch)
+            logits = arcface.inference(embeddings)
+            predicted = torch.argmax(logits, dim=1)
 
-                similarity_matrix = logits.detach().cpu().numpy()
-                fallback_classes = predicted.cpu().tolist()
-                num_classes = similarity_matrix.shape[1]
+            similarity_matrix = logits.detach().cpu().numpy()
+            fallback_classes = predicted.cpu().tolist()
+            num_classes = similarity_matrix.shape[1]
 
-                txt_classes = [det.class_id for det in detections]
-                txt_counts = _counts_from_classes(txt_classes, num_classes)
-                all_txt_counts.append(txt_counts.copy())
+            txt_classes = [det.class_id for det in detections]
+            txt_counts = _counts_from_classes(txt_classes, num_classes)
 
-                if first_hundred_distribution is None and len(all_txt_counts) >= 100:
-                    first_hundred_distribution = _average_distribution_from_counts(
-                        all_txt_counts[:100]
+            current_frame_number = processed_frames + 1
+
+            frame_tensor = TF.to_tensor(img)
+            hsv_image = img.convert("HSV")
+            v_channel = np.asarray(hsv_image, dtype=np.float32)[..., 2] / 255.0
+
+            if first_hundred_v_sum is None and current_frame_number <= 100:
+                first_hundred_v_sum = np.zeros_like(v_channel, dtype=np.float64)
+                base_v_shape = v_channel.shape
+
+            if current_frame_number <= 100 and first_hundred_v_sum is not None:
+                if base_v_shape is not None and v_channel.shape != base_v_shape:
+                    LOGGER.warning(
+                        "Frame %s shape mismatch for V channel averaging; expected %s, got %s",
+                        image_path.name,
+                        base_v_shape,
+                        v_channel.shape,
                     )
+                else:
+                    first_hundred_v_sum += v_channel.astype(np.float64)
+                    first_hundred_v_count += 1
+                    if current_frame_number == 100:
+                        divisor = max(first_hundred_v_count, 1)
+                        first_hundred_v_mean = (
+                            first_hundred_v_sum / float(divisor)
+                        ).astype(np.float32)
 
-                current_frame_number = processed_frames + 1
+            if (
+                current_frame_number > 100
+                and first_hundred_v_mean is None
+                and first_hundred_v_sum is not None
+                and first_hundred_v_count > 0
+            ):
+                first_hundred_v_mean = (
+                    first_hundred_v_sum / float(first_hundred_v_count)
+                ).astype(np.float32)
+
+                frame_stats = FrameStatistics(
+                    index=current_frame_number,
+                    txt_counts=txt_counts.copy(),
+                    v_channel=v_channel.astype(np.float32),
+                    image_tensor=frame_tensor,
+                    image_name=image_path.name,
+                )
+                recent_frames.append(frame_stats)
+
+                dropped_v_frames: list[FrameStatistics] = []
+                dropped_distribution_frame: Optional[FrameStatistics] = None
 
                 if reference_counts is None:
                     if any(txt_counts):
@@ -750,27 +894,100 @@ def run_inference() -> None:
                     else:
                         standard_counts = _remove_outlier_and_average(window)
                 else:
-                    if first_hundred_distribution is None:
+                    if first_hundred_v_mean is None or len(recent_frames) < 10:
                         standard_counts = reference_counts.copy()
                     else:
-                        window_counts = all_txt_counts[-10:]
-                        if len(window_counts) < 10:
+                        window_frames = list(recent_frames)
+                        if len(window_frames) < 10:
                             standard_counts = reference_counts.copy()
                         else:
-                            filtered = _drop_farthest_from_reference(
-                                window_counts, first_hundred_distribution, 4
-                            )
-                            if len(filtered) < 6:
-                                filtered = window_counts
-                            trimmed = _drop_most_anomalous_frame(filtered)
-                            if len(trimmed) > 5:
-                                trimmed = trimmed[-5:]
-                            if len(trimmed) < 5:
-                                trimmed = filtered[-5:]
-                            if not trimmed:
+                            differences: list[float] = []
+                            for frame_entry in window_frames:
+                                if frame_entry.v_channel.shape != first_hundred_v_mean.shape:
+                                    differences.append(float("inf"))
+                                else:
+                                    diff_value = float(
+                                        np.mean(
+                                            np.abs(frame_entry.v_channel - first_hundred_v_mean)
+                                        )
+                                    )
+                                    differences.append(diff_value)
+
+                            drop_order = np.argsort(differences)[::-1]
+                            drop_indices = drop_order[:4].tolist()
+                            drop_set = {int(idx) for idx in drop_indices}
+
+                            if len(drop_set) < 4 or len(window_frames) - len(drop_set) < 6:
                                 standard_counts = reference_counts.copy()
+                                dropped_v_frames = []
+                                dropped_distribution_frame = None
                             else:
-                                standard_counts = _average_counts(trimmed)
+                                dropped_v_frames = [
+                                    window_frames[int(idx)] for idx in drop_indices
+                                ]
+                                remaining_frames = [
+                                    frame_entry
+                                    for idx, frame_entry in enumerate(window_frames)
+                                    if idx not in drop_set
+                                ]
+
+                                if len(remaining_frames) != 6:
+                                    standard_counts = reference_counts.copy()
+                                    dropped_v_frames = []
+                                    dropped_distribution_frame = None
+                                else:
+                                    counts_array = [
+                                        frame_entry.txt_counts for frame_entry in remaining_frames
+                                    ]
+                                    if not counts_array or not counts_array[0]:
+                                        standard_counts = reference_counts.copy()
+                                        dropped_v_frames = []
+                                        dropped_distribution_frame = None
+                                    else:
+                                        distributions = [
+                                            _counts_to_distribution(counts)
+                                            for counts in counts_array
+                                        ]
+                                        num_classes_window = len(distributions[0])
+                                        mean_distribution = [
+                                            sum(
+                                                dist[class_idx]
+                                                for dist in distributions
+                                            )
+                                            / len(distributions)
+                                            for class_idx in range(num_classes_window)
+                                        ]
+                                        distances = [
+                                            sum(
+                                                abs(
+                                                    dist[class_idx]
+                                                    - mean_distribution[class_idx]
+                                                )
+                                                for class_idx in range(num_classes_window)
+                                            )
+                                            for dist in distributions
+                                        ]
+                                        anomalous_idx = int(np.argmax(distances))
+                                        dropped_distribution_frame = remaining_frames[
+                                            anomalous_idx
+                                        ]
+                                        final_frames = [
+                                            frame_entry
+                                            for idx, frame_entry in enumerate(remaining_frames)
+                                            if idx != anomalous_idx
+                                        ]
+
+                                        if len(final_frames) != 5:
+                                            standard_counts = reference_counts.copy()
+                                            dropped_v_frames = []
+                                            dropped_distribution_frame = None
+                                        else:
+                                            standard_counts = _average_counts(
+                                                [
+                                                    frame_entry.txt_counts
+                                                    for frame_entry in final_frames
+                                                ]
+                                            )
 
                 if len(standard_counts) != num_classes:
                     adjusted_counts = [0] * num_classes
@@ -799,6 +1016,49 @@ def run_inference() -> None:
                 annotated = draw_boxes(img, detections, final_predictions)
                 output_image_path = output_dir / image_path.name
                 annotated.save(output_image_path)
+
+                if dropped_v_frames:
+                    drop_names = ", ".join(
+                        f"{frame.image_name}(#{frame.index})" for frame in dropped_v_frames
+                    )
+                    LOGGER.info(
+                        "Frame %s excluded by V-channel difference: %s",
+                        image_path.name,
+                        drop_names,
+                    )
+                    v_batch = _stack_for_visdom(
+                        [frame.image_tensor for frame in dropped_v_frames]
+                    )
+                    if v_batch is not None:
+                        vis_logger.log_images(
+                            "Dropped_By_V_Channel",
+                            v_batch,
+                            nrow=min(4, v_batch.shape[0]),
+                        )
+
+                if dropped_distribution_frame is not None:
+                    LOGGER.info(
+                        "Frame %s excluded by class distribution anomaly: %s(#%d)",
+                        image_path.name,
+                        dropped_distribution_frame.image_name,
+                        dropped_distribution_frame.index,
+                    )
+                    distribution_batch = _stack_for_visdom(
+                        [dropped_distribution_frame.image_tensor]
+                    )
+                    if distribution_batch is not None:
+                        vis_logger.log_images(
+                            "Dropped_By_Class_Distribution",
+                            distribution_batch,
+                            nrow=1,
+                        )
+
+                annotated_tensor = TF.to_tensor(annotated)
+                vis_logger.log_images(
+                    "Annotated_Frame",
+                    annotated_tensor.unsqueeze(0),
+                    nrow=1,
+                )
 
                 grade_counts = {}
                 for pred in final_predictions:
