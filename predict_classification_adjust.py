@@ -289,36 +289,19 @@ def load_input_image(image_path: Path) -> Image.Image:
         img = raw_img.convert("RGB")
 
     width, height = img.size
-    target_width, target_height = TARGET_IMAGE_SIZE
-
-    removal_needed = max(height - target_height, 0)
-    removal_pixels = min(CROP_BOTTOM_PIXELS, removal_needed)
-
-    if removal_pixels > 0:
-        trimmed_height = height - removal_pixels
+    if height > CROP_BOTTOM_PIXELS:
+        trimmed_height = height - CROP_BOTTOM_PIXELS
         img = img.crop((0, 0, width, trimmed_height))
         width, height = img.size
-
-    if height > target_height:
-        img = img.crop((0, 0, width, target_height))
-        width, height = img.size
-    elif height < target_height:
+    else:
         LOGGER.warning(
-            "Image %s height %s below target height %s; unable to trim to match",  # type: ignore[str-format]
+            "Image %s height %s too small to trim %s pixels",  # type: ignore[str-format]
             image_path.name,
             height,
-            target_height,
+            CROP_BOTTOM_PIXELS,
         )
 
-    if width != target_width:
-        LOGGER.warning(
-            "Image %s width %s differs from expected %s",  # type: ignore[str-format]
-            image_path.name,
-            width,
-            target_width,
-        )
-
-    if height != target_height:
+    if (width, height) != TARGET_IMAGE_SIZE:
         LOGGER.warning(
             "Image %s has unexpected size %s after trimming; expected %s",  # type: ignore[str-format]
             image_path.name,
@@ -880,8 +863,6 @@ def run_inference() -> None:
                     first_hundred_v_sum / float(first_hundred_v_count)
                 ).astype(np.float32)
 
-            frame_stats: Optional[FrameStatistics] = None
-            if current_frame_number > 100:
                 frame_stats = FrameStatistics(
                     index=current_frame_number,
                     txt_counts=txt_counts.copy(),
@@ -891,126 +872,169 @@ def run_inference() -> None:
                 )
                 recent_frames.append(frame_stats)
 
-            dropped_v_frames: list[FrameStatistics] = []
-            dropped_distribution_frame: Optional[FrameStatistics] = None
+                dropped_v_frames: list[FrameStatistics] = []
+                dropped_distribution_frame: Optional[FrameStatistics] = None
 
-            if reference_counts is None:
-                if any(txt_counts):
-                    reference_counts = txt_counts.copy()
-                else:
-                    LOGGER.warning(
-                        "No valid class annotations found for %s; falling back to predictions",
-                        txt_path.name,
-                    )
-                    reference_counts = _counts_from_classes(fallback_classes, num_classes)
-                standard_counts = reference_counts.copy()
-            elif current_frame_number <= 5:
-                standard_counts = reference_counts.copy()
-            elif current_frame_number <= 100:
-                window = reference_history[-5:] + [txt_counts]
-                if len(window) < 6 or not any(txt_counts):
-                    standard_counts = reference_counts.copy()
-                else:
-                    standard_counts = _remove_outlier_and_average(window)
-            else:
+                frame_tensor = TF.to_tensor(img)
+                hsv_image = img.convert("HSV")
+                v_channel = np.asarray(hsv_image, dtype=np.float32)[..., 2] / 255.0
+
+                if first_hundred_v_sum is None and current_frame_number <= 100:
+                    first_hundred_v_sum = np.zeros_like(v_channel, dtype=np.float64)
+                    base_v_shape = v_channel.shape
+
+                if current_frame_number <= 100 and first_hundred_v_sum is not None:
+                    if base_v_shape is not None and v_channel.shape != base_v_shape:
+                        LOGGER.warning(
+                            "Frame %s shape mismatch for V channel averaging; expected %s, got %s",
+                            image_path.name,
+                            base_v_shape,
+                            v_channel.shape,
+                        )
+                    else:
+                        first_hundred_v_sum += v_channel.astype(np.float64)
+                        first_hundred_v_count += 1
+                        if current_frame_number == 100:
+                            divisor = max(first_hundred_v_count, 1)
+                            first_hundred_v_mean = (
+                                first_hundred_v_sum / float(divisor)
+                            ).astype(np.float32)
+
                 if (
-                    first_hundred_v_mean is None
-                    or frame_stats is None
-                    or len(recent_frames) < 10
+                    current_frame_number > 100
+                    and first_hundred_v_mean is None
+                    and first_hundred_v_sum is not None
+                    and first_hundred_v_count > 0
                 ):
+                    first_hundred_v_mean = (
+                        first_hundred_v_sum / float(first_hundred_v_count)
+                    ).astype(np.float32)
+
+                frame_stats = FrameStatistics(
+                    index=current_frame_number,
+                    txt_counts=txt_counts.copy(),
+                    v_channel=v_channel.astype(np.float32),
+                    image_tensor=frame_tensor,
+                    image_name=image_path.name,
+                )
+                recent_frames.append(frame_stats)
+
+                dropped_v_frames: list[FrameStatistics] = []
+                dropped_distribution_frame: Optional[FrameStatistics] = None
+
+                if reference_counts is None:
+                    if any(txt_counts):
+                        reference_counts = txt_counts.copy()
+                    else:
+                        LOGGER.warning(
+                            "No valid class annotations found for %s; falling back to predictions",
+                            txt_path.name,
+                        )
+                        reference_counts = _counts_from_classes(fallback_classes, num_classes)
                     standard_counts = reference_counts.copy()
-                else:
-                    window_frames = list(recent_frames)
-                    if len(window_frames) < 10:
+                elif current_frame_number <= 5:
+                    standard_counts = reference_counts.copy()
+                elif current_frame_number <= 100:
+                    window = reference_history[-5:] + [txt_counts]
+                    if len(window) < 6 or not any(txt_counts):
                         standard_counts = reference_counts.copy()
                     else:
-                        differences: list[float] = []
-                        for frame_entry in window_frames:
-                            if frame_entry.v_channel.shape != first_hundred_v_mean.shape:
-                                differences.append(float("inf"))
-                            else:
-                                diff_value = float(
-                                    np.mean(
-                                        np.abs(frame_entry.v_channel - first_hundred_v_mean)
-                                    )
-                                )
-                                differences.append(diff_value)
-
-                        drop_order = np.argsort(differences)[::-1]
-                        drop_indices = drop_order[:4].tolist()
-                        drop_set = {int(idx) for idx in drop_indices}
-
-                        if len(drop_set) < 4 or len(window_frames) - len(drop_set) < 6:
+                        standard_counts = _remove_outlier_and_average(window)
+                else:
+                    if first_hundred_v_mean is None or len(recent_frames) < 10:
+                        standard_counts = reference_counts.copy()
+                    else:
+                        window_frames = list(recent_frames)
+                        if len(window_frames) < 10:
                             standard_counts = reference_counts.copy()
-                            dropped_v_frames = []
-                            dropped_distribution_frame = None
                         else:
-                            dropped_v_frames = [
-                                window_frames[int(idx)] for idx in drop_indices
-                            ]
-                            remaining_frames = [
-                                frame_entry
-                                for idx, frame_entry in enumerate(window_frames)
-                                if idx not in drop_set
-                            ]
+                            differences: list[float] = []
+                            for frame_entry in window_frames:
+                                if frame_entry.v_channel.shape != first_hundred_v_mean.shape:
+                                    differences.append(float("inf"))
+                                else:
+                                    diff_value = float(
+                                        np.mean(
+                                            np.abs(frame_entry.v_channel - first_hundred_v_mean)
+                                        )
+                                    )
+                                    differences.append(diff_value)
 
-                            if len(remaining_frames) != 6:
+                            drop_order = np.argsort(differences)[::-1]
+                            drop_indices = drop_order[:4].tolist()
+                            drop_set = {int(idx) for idx in drop_indices}
+
+                            if len(drop_set) < 4 or len(window_frames) - len(drop_set) < 6:
                                 standard_counts = reference_counts.copy()
                                 dropped_v_frames = []
                                 dropped_distribution_frame = None
                             else:
-                                counts_array = [
-                                    frame_entry.txt_counts for frame_entry in remaining_frames
+                                dropped_v_frames = [
+                                    window_frames[int(idx)] for idx in drop_indices
                                 ]
-                                if not counts_array or not counts_array[0]:
+                                remaining_frames = [
+                                    frame_entry
+                                    for idx, frame_entry in enumerate(window_frames)
+                                    if idx not in drop_set
+                                ]
+
+                                if len(remaining_frames) != 6:
                                     standard_counts = reference_counts.copy()
                                     dropped_v_frames = []
                                     dropped_distribution_frame = None
                                 else:
-                                    distributions = [
-                                        _counts_to_distribution(counts)
-                                        for counts in counts_array
+                                    counts_array = [
+                                        frame_entry.txt_counts for frame_entry in remaining_frames
                                     ]
-                                    num_classes_window = len(distributions[0])
-                                    mean_distribution = [
-                                        sum(
-                                            dist[class_idx]
-                                            for dist in distributions
-                                        )
-                                        / len(distributions)
-                                        for class_idx in range(num_classes_window)
-                                    ]
-                                    distances = [
-                                        sum(
-                                            abs(
-                                                dist[class_idx]
-                                                - mean_distribution[class_idx]
-                                            )
-                                            for class_idx in range(num_classes_window)
-                                        )
-                                        for dist in distributions
-                                    ]
-                                    anomalous_idx = int(np.argmax(distances))
-                                    dropped_distribution_frame = remaining_frames[
-                                        anomalous_idx
-                                    ]
-                                    final_frames = [
-                                        frame_entry
-                                        for idx, frame_entry in enumerate(remaining_frames)
-                                        if idx != anomalous_idx
-                                    ]
-
-                                    if len(final_frames) != 5:
+                                    if not counts_array or not counts_array[0]:
                                         standard_counts = reference_counts.copy()
                                         dropped_v_frames = []
                                         dropped_distribution_frame = None
                                     else:
-                                        standard_counts = _average_counts(
-                                            [
-                                                frame_entry.txt_counts
-                                                for frame_entry in final_frames
-                                            ]
-                                        )
+                                        distributions = [
+                                            _counts_to_distribution(counts)
+                                            for counts in counts_array
+                                        ]
+                                        num_classes_window = len(distributions[0])
+                                        mean_distribution = [
+                                            sum(
+                                                dist[class_idx]
+                                                for dist in distributions
+                                            )
+                                            / len(distributions)
+                                            for class_idx in range(num_classes_window)
+                                        ]
+                                        distances = [
+                                            sum(
+                                                abs(
+                                                    dist[class_idx]
+                                                    - mean_distribution[class_idx]
+                                                )
+                                                for class_idx in range(num_classes_window)
+                                            )
+                                            for dist in distributions
+                                        ]
+                                        anomalous_idx = int(np.argmax(distances))
+                                        dropped_distribution_frame = remaining_frames[
+                                            anomalous_idx
+                                        ]
+                                        final_frames = [
+                                            frame_entry
+                                            for idx, frame_entry in enumerate(remaining_frames)
+                                            if idx != anomalous_idx
+                                        ]
+
+                                        if len(final_frames) != 5:
+                                            standard_counts = reference_counts.copy()
+                                            dropped_v_frames = []
+                                            dropped_distribution_frame = None
+                                        else:
+                                            standard_counts = _average_counts(
+                                                [
+                                                    frame_entry.txt_counts
+                                                    for frame_entry in final_frames
+                                                ]
+                                            )
 
                 if len(standard_counts) != num_classes:
                     adjusted_counts = [0] * num_classes
