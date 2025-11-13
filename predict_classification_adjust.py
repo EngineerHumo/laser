@@ -875,6 +875,53 @@ def run_inference() -> None:
                 dropped_v_frames: list[FrameStatistics] = []
                 dropped_distribution_frame: Optional[FrameStatistics] = None
 
+                frame_tensor = TF.to_tensor(img)
+                hsv_image = img.convert("HSV")
+                v_channel = np.asarray(hsv_image, dtype=np.float32)[..., 2] / 255.0
+
+                if first_hundred_v_sum is None and current_frame_number <= 100:
+                    first_hundred_v_sum = np.zeros_like(v_channel, dtype=np.float64)
+                    base_v_shape = v_channel.shape
+
+                if current_frame_number <= 100 and first_hundred_v_sum is not None:
+                    if base_v_shape is not None and v_channel.shape != base_v_shape:
+                        LOGGER.warning(
+                            "Frame %s shape mismatch for V channel averaging; expected %s, got %s",
+                            image_path.name,
+                            base_v_shape,
+                            v_channel.shape,
+                        )
+                    else:
+                        first_hundred_v_sum += v_channel.astype(np.float64)
+                        first_hundred_v_count += 1
+                        if current_frame_number == 100:
+                            divisor = max(first_hundred_v_count, 1)
+                            first_hundred_v_mean = (
+                                first_hundred_v_sum / float(divisor)
+                            ).astype(np.float32)
+
+                if (
+                    current_frame_number > 100
+                    and first_hundred_v_mean is None
+                    and first_hundred_v_sum is not None
+                    and first_hundred_v_count > 0
+                ):
+                    first_hundred_v_mean = (
+                        first_hundred_v_sum / float(first_hundred_v_count)
+                    ).astype(np.float32)
+
+                frame_stats = FrameStatistics(
+                    index=current_frame_number,
+                    txt_counts=txt_counts.copy(),
+                    v_channel=v_channel.astype(np.float32),
+                    image_tensor=frame_tensor,
+                    image_name=image_path.name,
+                )
+                recent_frames.append(frame_stats)
+
+                dropped_v_frames: list[FrameStatistics] = []
+                dropped_distribution_frame: Optional[FrameStatistics] = None
+
                 if reference_counts is None:
                     if any(txt_counts):
                         reference_counts = txt_counts.copy()
