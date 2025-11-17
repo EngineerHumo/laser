@@ -8,6 +8,7 @@ from .spot_dataset import (
     SpotSample,
     SpotSubsetDataset,
     build_global_transform,
+    build_shared_hsv_transform,
     build_spot_transform,
     create_stratified_folds,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "SpotSubsetDataset",
     "BalancedBatchSampler",
     "build_global_transform",
+    "build_shared_hsv_transform",
     "build_spot_transform",
     "create_stratified_folds",
     "SPOT_MEAN",

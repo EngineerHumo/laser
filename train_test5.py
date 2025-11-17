@@ -24,6 +24,7 @@ from laser.datasets import (
     SpotSample,
     SpotSubsetDataset,
     build_global_transform,
+    build_shared_hsv_transform,
     build_spot_transform,
     create_stratified_folds,
 )
@@ -120,12 +121,14 @@ def create_dataloaders(
     train_spot_transform = build_spot_transform(augment=True)
     eval_spot_transform = build_spot_transform(augment=False)
     global_transform = build_global_transform()
+    shared_hsv_transform = build_shared_hsv_transform()
 
     train_subset = SpotSubsetDataset(
         dataset,
         train_indices,
         spot_transform=train_spot_transform,
         global_transform=global_transform,
+        pair_transform=shared_hsv_transform,
     )
     val_subset = SpotSubsetDataset(
         dataset,

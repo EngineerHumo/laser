@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -35,6 +36,7 @@ SPOT_STD = [0.229, 0.224, 0.225]
 
 SpotTransform = Callable[[Image.Image], Tuple[Tensor, Tensor]]
 GlobalTransform = Callable[[Image.Image], Tensor]
+PairTransform = Callable[[Image.Image, Image.Image], Tuple[Image.Image, Image.Image]]
 
 
 def build_spot_transform(augment: bool = False) -> SpotTransform:
@@ -100,6 +102,42 @@ def _default_global_transform() -> GlobalTransform:
     return build_global_transform()
 
 
+def build_shared_hsv_transform(
+    hue_delta: float = 0.02,
+    saturation_range: Tuple[float, float] = (0.95, 1.05),
+    value_range: Tuple[float, float] = (0.95, 1.05),
+    probability: float = 1.0,
+) -> PairTransform:
+    """Create a transform that applies identical HSV jitter to paired images.
+
+    Args:
+        hue_delta: Maximum absolute hue shift applied in the range ``[-hue_delta, hue_delta]``.
+        saturation_range: Multiplicative range for saturation changes.
+        value_range: Multiplicative range for value (brightness) changes.
+        probability: Probability of applying the jitter to a given pair.
+    """
+
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be in the range [0, 1]")
+
+    def transform(spot_img: Image.Image, global_img: Image.Image) -> Tuple[Image.Image, Image.Image]:
+        if random.random() >= probability:
+            return spot_img, global_img
+
+        hue_adjust = random.uniform(-hue_delta, hue_delta)
+        saturation_factor = random.uniform(*saturation_range)
+        value_factor = random.uniform(*value_range)
+
+        def _apply(image: Image.Image) -> Image.Image:
+            image = TF.adjust_brightness(image, value_factor)
+            image = TF.adjust_saturation(image, saturation_factor)
+            return TF.adjust_hue(image, hue_adjust)
+
+        return _apply(spot_img), _apply(global_img)
+
+    return transform
+
+
 class SpotDataset(Dataset[SpotSample]):
     """Dataset yielding spot crops alongside down-sampled global context images."""
 
@@ -108,6 +146,7 @@ class SpotDataset(Dataset[SpotSample]):
         root: Path | str = Path("data"),
         spot_transform: Optional[SpotTransform] = None,
         global_transform: Optional[GlobalTransform] = None,
+        pair_transform: Optional[PairTransform] = None,
     ) -> None:
         self.root = Path(root)
         self.spot_dir = self.root / "spot"
@@ -119,6 +158,7 @@ class SpotDataset(Dataset[SpotSample]):
 
         self.spot_transform = spot_transform or _default_spot_transform()
         self.global_transform = global_transform or _default_global_transform()
+        self.pair_transform = pair_transform
 
         self.entries: List[Tuple[str, int]] = []
         self.class_to_indices: Dict[int, List[int]] = {}
@@ -169,7 +209,7 @@ class SpotDataset(Dataset[SpotSample]):
         return len(self.entries)
 
     def __getitem__(self, index: int) -> SpotSample:
-        return self.load_sample(index)
+        return self.load_sample(index, pair_transform=self.pair_transform)
 
     def load_sample(
         self,
@@ -177,9 +217,11 @@ class SpotDataset(Dataset[SpotSample]):
         *,
         spot_transform: Optional[SpotTransform] = None,
         global_transform: Optional[GlobalTransform] = None,
+        pair_transform: Optional[PairTransform] = None,
     ) -> SpotSample:
         spot_transform = spot_transform or self.spot_transform
         global_transform = global_transform or self.global_transform
+        pair_transform = pair_transform or self.pair_transform
 
         spot_name, label = self.entries[index]
         spot_path = self.spot_dir / f"{spot_name}.png"
@@ -191,12 +233,14 @@ class SpotDataset(Dataset[SpotSample]):
         if not global_path.exists():
             raise FileNotFoundError(f"Global context image not found: {global_path}")
 
-        with Image.open(spot_path) as spot_img:
+        with Image.open(spot_path) as spot_img, Image.open(global_path) as global_img:
             spot_img = spot_img.convert("RGB")
-            spot_tensor, spot_context_tensor = spot_transform(spot_img)
-
-        with Image.open(global_path) as global_img:
             global_img = global_img.convert("RGB")
+
+            if pair_transform is not None:
+                spot_img, global_img = pair_transform(spot_img, global_img)
+
+            spot_tensor, spot_context_tensor = spot_transform(spot_img)
             global_tensor = global_transform(global_img)
 
         return SpotSample(
@@ -219,11 +263,13 @@ class SpotSubsetDataset(Dataset[SpotSample]):
         *,
         spot_transform: Optional[SpotTransform] = None,
         global_transform: Optional[GlobalTransform] = None,
+        pair_transform: Optional[PairTransform] = None,
     ) -> None:
         self.dataset = dataset
         self.indices = list(indices)
         self.spot_transform = spot_transform
         self.global_transform = global_transform
+        self.pair_transform = pair_transform
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -234,6 +280,7 @@ class SpotSubsetDataset(Dataset[SpotSample]):
             base_index,
             spot_transform=self.spot_transform,
             global_transform=self.global_transform,
+            pair_transform=self.pair_transform,
         )
 
 
