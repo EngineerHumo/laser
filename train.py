@@ -24,6 +24,7 @@ from laser.datasets import (
     SpotSample,
     SpotSubsetDataset,
     build_global_transform,
+    build_shared_hsv_transform,
     build_spot_transform,
 )
 from laser.models import DualEncoderMetricModel
@@ -118,12 +119,14 @@ def create_dataloaders(
     train_spot_transform = build_spot_transform(augment=True)
     eval_spot_transform = build_spot_transform(augment=False)
     global_transform = build_global_transform()
+    shared_hsv_transform = build_shared_hsv_transform()
 
     train_subset = SpotSubsetDataset(
         train_dataset,
         list(range(len(train_dataset))),
         spot_transform=train_spot_transform,
         global_transform=global_transform,
+        pair_transform=shared_hsv_transform,
     )
     val_subset = SpotSubsetDataset(
         val_dataset,
