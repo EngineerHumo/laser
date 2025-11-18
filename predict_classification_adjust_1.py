@@ -58,6 +58,10 @@ CLASS_COLORS = {
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+CROP_BOTTOM_PIXELS = 38
+TARGET_IMAGE_SIZE = (1240, 1240)
+
+
 @dataclass
 class Detection:
     """Container describing a YOLO-format detection."""
@@ -278,6 +282,34 @@ def iter_image_files(directory: Path) -> Iterable[Path]:
     for path in sorted(directory.iterdir()):
         if path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS and path.is_file():
             yield path
+
+
+def load_input_image(image_path: Path) -> Image.Image:
+    with Image.open(image_path) as raw_img:
+        img = raw_img.convert("RGB")
+
+    width, height = img.size
+    if height > CROP_BOTTOM_PIXELS:
+        trimmed_height = height - CROP_BOTTOM_PIXELS
+        img = img.crop((0, 0, width, trimmed_height))
+        width, height = img.size
+    else:
+        LOGGER.warning(
+            "Image %s height %s too small to trim %s pixels",  # type: ignore[str-format]
+            image_path.name,
+            height,
+            CROP_BOTTOM_PIXELS,
+        )
+
+    if (width, height) != TARGET_IMAGE_SIZE:
+        LOGGER.warning(
+            "Image %s has unexpected size %s after trimming; expected %s",  # type: ignore[str-format]
+            image_path.name,
+            (width, height),
+            TARGET_IMAGE_SIZE,
+        )
+
+    return img
 
 
 def legend_entries() -> Sequence[tuple[int, str]]:
